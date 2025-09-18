@@ -8,6 +8,8 @@ from tqdm import tqdm
 from typing import Tuple
 from torch import Tensor
 import gc
+import joblib
+import os
 
 
 class WarpGBM(BaseEstimator, RegressorMixin):
@@ -192,7 +194,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         else:
             self.bin_edges = None
 
-        print(f"Loaded checkpoint into current WarpGBM instance from {path}. Already {loaded_len} trees, will grow additional {self.n_estimators - loaded_len}).")
+        print(f"Loaded checkpoint into current WarpGBM instance from {path}. Already {loaded_len} trees, will grow additional {self.n_estimators - loaded_len) trees.")
 
     def validate_fit_params(
         self, X, y, era_id, X_eval, y_eval, eval_every_n_trees, early_stopping_rounds, eval_metric

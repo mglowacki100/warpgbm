@@ -231,6 +231,15 @@ wgbm_model.fit(X, y, init_model="ckpt_100.pkl")
 print('WarpGBN number of trees: ', wgbm_model.n_estimators)
 ```
 
+**Continuous learning output:**
+
+```
+Finished training forest.
+Saved WarpGBM checkpoint to ckpt_100.pkl
+Loaded checkpoint into current WarpGBM instance from ckpt_100.pkl. Already 100 trees, will grow additional 100 trees.
+Finished training forest.
+WarpGBN number of trees:  200
+```
 ---
 
 ### Pre-binned Data Example (Numerai)

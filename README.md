@@ -222,6 +222,7 @@ wgbm_model.fit(X, y, init_model="ckpt_100.pkl")
 
 # Results
 print('WarpGBN number of trees: ', wgbm_model.n_estimators)
+```
 
 ---
 

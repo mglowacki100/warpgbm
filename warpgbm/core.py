@@ -9,6 +9,7 @@ from typing import Tuple
 from torch import Tensor
 import gc
 
+
 class WarpGBM(BaseEstimator, RegressorMixin):
     def __init__(
         self,
@@ -124,6 +125,75 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                 f"Invalid colsample_bytree: {kwargs['colsample_bytree']}. Must be a float value > 0 and <= 1."
             )
 
+    def save_model(self, path: str):
+        """
+        Save a CPU-serializable snapshot of the model to `path` using joblib.
+        We convert CUDA tensors to numpy / python objects first.
+        """
+        # Ensure directory exists
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+
+        # Prepare serializable state
+        state = {
+            "meta": {
+                "num_bins": self.num_bins,
+                "max_depth": self.max_depth,
+                "learning_rate": self.learning_rate,
+                "n_estimators": self.n_estimators,
+                "min_child_weight": self.min_child_weight,
+                "min_split_gain": self.min_split_gain,
+                "L2_reg": self.L2_reg,
+                "L1_reg": self.L1_reg,
+                "colsample_bytree": self.colsample_bytree,
+            },
+            # forest is a list of nested dicts (already python-native)
+            "forest": self.forest,
+            "base_prediction": float(self.base_prediction) if self.base_prediction is not None else None,
+            # bin_edges -> list of 1d lists or None
+            "bin_edges": None if self.bin_edges is None else [
+                be.detach().cpu().numpy().tolist() if isinstance(be, torch.Tensor) else np.asarray(be).tolist()
+                for be in (self.bin_edges if isinstance(self.bin_edges, (list, tuple)) else self.bin_edges)
+            ],
+        }
+
+        joblib.dump(state, path)
+        print(f"Saved WarpGBM checkpoint to {path}")
+
+
+    def load_state(self, path: str):
+        """
+        Load checkpoint state into current instance (does not re-instantiate).
+        Useful for continuing training with different hyperparams (e.g. increase n_estimators).
+        """
+        state = joblib.load(path)
+        forest = state.get("forest", None)
+        if forest is None:
+            raise ValueError("Checkpoint does not contain 'forest' key.")
+
+        # Convert loaded forest into self.forest, preserving self.n_estimators:
+        loaded_len = len(forest)
+        
+        self.forest = list(forest) + [{} for _ in range(self.n_estimators)]
+        self._start_tree = loaded_len
+        self.n_estimators = loaded_len + self.n_estimators
+
+        # base_prediction
+        bp = state.get("base_prediction", None)
+        self.base_prediction = float(bp) if bp is not None else None
+
+        # bin_edges -> convert to device tensor
+        bin_edges = state.get("bin_edges", None)
+        if bin_edges is not None:
+            be_tensor = torch.empty((len(bin_edges), len(bin_edges[0]) if len(bin_edges) else 0),
+                                    dtype=torch.float32, device=self.device)
+            for i, be in enumerate(bin_edges):
+                be_tensor[i, :] = torch.tensor(be, dtype=torch.float32, device=self.device)
+            self.bin_edges = be_tensor
+        else:
+            self.bin_edges = None
+
+        print(f"Loaded checkpoint into current WarpGBM instance from {path}. Already {loaded_len} trees, will grow additional {self.n_estimators - loaded_len}).")
+
     def validate_fit_params(
         self, X, y, era_id, X_eval, y_eval, eval_every_n_trees, early_stopping_rounds, eval_metric
     ):
@@ -210,10 +280,23 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         eval_every_n_trees=None,
         early_stopping_rounds=None,
         eval_metric = "mse",
+        init_model: str = None,
     ):
         early_stopping_rounds = self.validate_fit_params(
             X, y, era_id, X_eval, y_eval, eval_every_n_trees, early_stopping_rounds, eval_metric
         )
+
+        # If user provided init_model, load checkpoint into this instance.
+        # This will set self.forest and self.bin_edges and _start_tree marker.
+        if init_model is not None:
+            if not isinstance(init_model, str):
+                raise TypeError("init_model must be a filepath string.")
+            self.load_state(init_model)
+        else:
+            # No checkpoint: ensure start index is 0 and forest initialized
+            self._start_tree = 0
+            if self.forest is None or not isinstance(self.forest, list) or len(self.forest) != self.n_estimators:
+                self.forest = [{} for _ in range(self.n_estimators)]
 
         if era_id is None:
             era_id = np.ones(X.shape[0], dtype="int32")
@@ -249,8 +332,12 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             self.early_stopping_rounds = None
 
         # ─── Grow the forest ───
+        #with torch.no_grad():
+        #    self.grow_forest()
         with torch.no_grad():
-            self.grow_forest()
+            # use previously set _start_tree (0 if none)
+            start_idx = getattr(self, "_start_tree", 0)
+            self.grow_forest(start_tree=start_idx)
 
         del self.bin_indices
         del self.Y_gpu
@@ -448,7 +535,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
 
             del eval_preds, eval_loss, train_loss
 
-    def grow_forest(self):
+    def grow_forest(self, start_tree: int = 0):
         self.training_loss = []
         self.eval_loss = []  # if eval set is given
         self.stop = False
@@ -462,7 +549,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         self.per_era_gain = torch.zeros(self.num_eras, k, self.num_bins-1, device=self.device, dtype=torch.float32)
         self.per_era_direction = torch.zeros(self.num_eras, k, self.num_bins-1, device=self.device, dtype=torch.float32)
 
-        for i in range(self.n_estimators):
+        for i in range(start_tree, self.n_estimators):
             self.residual = self.Y_gpu - self.gradients
 
             if self.colsample_bytree < 1.0:

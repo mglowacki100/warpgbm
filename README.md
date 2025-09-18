@@ -34,6 +34,7 @@ If your data evolves over time, WarpGBM is the only GBDT library designed to *ad
 - Supports **pre-binned data** or **automatic quantile binning**
 - Works with `float32` or `int8` inputs
 - Built-in **validation and early stopping** support with MSE, RMSLE, or correlation metrics
+- Supports continous learning
 - Simple install with `pip`, no custom drivers required
 
 > 💡 **Note:** WarpGBM v1.0.0 is a *generalization* of the traditional GBDT algorithm.
@@ -195,6 +196,32 @@ print(f"WarpGBM:     corr = {np.corrcoef(wgbm_preds, y)[0,1]:.4f}, time = {wgbm_
 LightGBM:   corr = 0.8742, time = 37.33s
 WarpGBM:     corr = 0.8621, time = 5.40s
 ```
+
+---
+
+### Continous learning
+
+```python
+import numpy as np
+from sklearn.datasets import make_regression
+from warpgbm import WarpGBM
+
+# Create synthetic regression dataset
+X, y = make_regression(n_samples=100_000, n_features=500, noise=0.1, random_state=42)
+X = X.astype(np.float32)
+y = y.astype(np.float32)
+
+# Train WarpGBM inital model
+wgbm_model = WarpGBM(max_depth=5, n_estimators=100, learning_rate=0.01, num_bins=7)
+wgbm_model.fit(X, y)
+wgbm_model.save_model("ckpt_100.pkl")
+
+# Continue training of WarpGBM inital model
+wgbm_model = WarpGBM(n_estimators=100)
+wgbm_model.fit(X, y, init_model="ckpt_100.pkl")
+
+# Results
+print('WarpGBN number of trees: ', wgbm_model.n_estimators)
 
 ---
 

@@ -201,6 +201,13 @@ WarpGBM:     corr = 0.8621, time = 5.40s
 
 ### Continous learning
 
+WarpGBM supports continuous (incremental) learning, allowing you to extend training from a previously saved model checkpoint instead of starting from scratch.
+This makes it possible to:
+- Train in stages without retraining the entire model
+- Adapt an existing model as new data becomes available
+- Reduce training time by reusing previously learned trees
+You can save a trained model with `.save_model()` and later resume training by passing its path to the `init_model` parameter in `.fit()`.
+
 ```python
 import numpy as np
 from sklearn.datasets import make_regression

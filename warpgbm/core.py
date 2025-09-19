@@ -194,7 +194,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         else:
             self.bin_edges = None
 
-        print(f"Loaded checkpoint into current WarpGBM instance from {path}. Already {loaded_len} trees, will grow additional {self.n_estimators - loaded_len) trees.")
+        print(f"Loaded checkpoint into current WarpGBM instance from {path}. Already {loaded_len} trees, will grow additional {self.n_estimators - loaded_len} trees.")
 
     def validate_fit_params(
         self, X, y, era_id, X_eval, y_eval, eval_every_n_trees, early_stopping_rounds, eval_metric

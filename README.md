@@ -374,7 +374,7 @@ Built on the shoulders of PyTorch, scikit-learn, LightGBM, XGBoost, and the CUDA
 
 ## 📝 Version History
 
-### v1.1.0 (Current - `multiclass` branch)
+### v2.0.0 (Current)
 - ✨ **Multiclass classification support** via softmax objective
 - 🎯 Binary classification mode
 - 📊 New metrics: log loss, accuracy
@@ -382,6 +382,9 @@ Built on the shoulders of PyTorch, scikit-learn, LightGBM, XGBoost, and the CUDA
 - 🔮 `predict_proba()` for probability outputs
 - ✅ Comprehensive test suite for classification
 - 🔒 Full backward compatibility with regression
+- 🐛 Fixed unused variable issue (#8)
+- 🧹 Removed unimplemented L1_reg parameter
+- 📚 Major documentation overhaul with AGENT_GUIDE.md
 
 ### v1.0.0
 - 🧠 Invariant learning via Directional Era-Splitting (DES)

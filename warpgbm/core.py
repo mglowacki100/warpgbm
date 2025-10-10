@@ -23,7 +23,6 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         threads_per_block=64,
         rows_per_thread=4,
         L2_reg=1e-6,
-        L1_reg=0.0,
         device="cuda",
         colsample_bytree=1.0,
     ):
@@ -39,7 +38,6 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             threads_per_block=threads_per_block,
             rows_per_thread=rows_per_thread,
             L2_reg=L2_reg,
-            L1_reg=L1_reg,
             colsample_bytree=colsample_bytree,
         )
 
@@ -69,7 +67,6 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         self.threads_per_block = threads_per_block
         self.rows_per_thread = rows_per_thread
         self.L2_reg = L2_reg
-        self.L1_reg = L1_reg
         self.forest = [{} for _ in range(self.n_estimators)]
         self.colsample_bytree = colsample_bytree
         self.label_encoder = None
@@ -94,7 +91,6 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             "learning_rate",
             "min_split_gain",
             "L2_reg",
-            "L1_reg",
             "colsample_bytree",
         ]
 
@@ -130,8 +126,8 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             raise ValueError(
                 "rows_per_thread must be positive between 1 and 16 inclusive."
             )
-        if kwargs["L2_reg"] < 0 or kwargs["L1_reg"] < 0:
-            raise ValueError("L2_reg and L1_reg must be non-negative.")
+        if kwargs["L2_reg"] < 0:
+            raise ValueError("L2_reg must be non-negative.")
         if kwargs["colsample_bytree"] <= 0 or kwargs["colsample_bytree"] > 1:
             raise ValueError(
                 f"Invalid colsample_bytree: {kwargs['colsample_bytree']}. Must be a float value > 0 and <= 1."
@@ -295,10 +291,6 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         self.root_node_indices = torch.arange(self.num_samples, device=self.device, dtype=torch.int32)
         self.base_prediction = self.Y_gpu.mean().item()
         self.gradients += self.base_prediction
-        if self.colsample_bytree < 1.0:
-            k = max(1, int(self.colsample_bytree * self.num_features))
-        else:
-            k = self.num_features
         self.feature_indices = torch.arange(self.num_features, device=self.device, dtype=torch.int32)
 
         # ─── Optional Eval Set ───

@@ -424,14 +424,19 @@ Built on the shoulders of PyTorch, scikit-learn, LightGBM, XGBoost, and the CUDA
 
 ## 📝 Version History
 
-### v2.0.0 (Current)
+### v2.1.0 (Current)
+- 🔍 **Feature importance** with gain-based tracking and unique per-era analysis
+- 📊 `get_feature_importance()` and `get_per_era_feature_importance()` methods
+- ✅ Comprehensive test suite comparing with LightGBM
+- 📚 Updated documentation with feature importance examples
+
+### v2.0.0
 - ✨ **Multiclass classification support** via softmax objective
 - 🎯 Binary classification mode
 - 📊 New metrics: log loss, accuracy
 - 🏷️ Automatic label encoding (supports strings)
 - 🔮 `predict_proba()` for probability outputs
-- 🔍 **Feature importance** with gain-based tracking and unique per-era analysis
-- ✅ Comprehensive test suite for classification and feature importance
+- ✅ Comprehensive test suite for classification
 - 🔒 Full backward compatibility with regression
 - 🐛 Fixed unused variable issue (#8)
 - 🧹 Removed unimplemented L1_reg parameter

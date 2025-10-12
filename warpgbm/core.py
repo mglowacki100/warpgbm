@@ -25,6 +25,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         L2_reg=1e-6,
         device="cuda",
         colsample_bytree=1.0,
+        random_state=None,
     ):
         # Validate arguments
         self._validate_hyperparams(
@@ -69,6 +70,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         self.L2_reg = L2_reg
         self.forest = [{} for _ in range(self.n_estimators)]
         self.colsample_bytree = colsample_bytree
+        self.random_state = random_state
         self.label_encoder = None
         self.feature_importance_ = None
         self.per_era_feature_importance_ = None
@@ -256,6 +258,17 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         early_stopping_rounds = self.validate_fit_params(
             X, y, era_id, X_eval, y_eval, eval_every_n_trees, early_stopping_rounds, eval_metric
         )
+
+        # Set random seed for reproducibility
+        if self.random_state is not None:
+            torch.manual_seed(self.random_state)
+            np.random.seed(self.random_state)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed(self.random_state)
+                torch.cuda.manual_seed_all(self.random_state)
+                # Note: Some CUDA operations may still be non-deterministic
+                # For full determinism, set: torch.use_deterministic_algorithms(True)
+                # but this may impact performance
 
         if era_id is None:
             era_id = np.ones(X.shape[0], dtype="int32")

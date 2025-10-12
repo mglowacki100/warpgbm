@@ -311,6 +311,7 @@ WarpGBM(
     min_split_gain=0.0,            # Min loss reduction to split
     L2_reg=1e-6,                   # L2 leaf regularization
     colsample_bytree=1.0,          # Feature subsample ratio per tree
+    random_state=None,             # Random seed for reproducibility
     threads_per_block=64,          # CUDA block size (tune for your GPU)
     rows_per_thread=4,             # Rows processed per thread
     device='cuda'                  # 'cuda' or 'cpu' (GPU strongly recommended)
@@ -424,7 +425,12 @@ Built on the shoulders of PyTorch, scikit-learn, LightGBM, XGBoost, and the CUDA
 
 ## 📝 Version History
 
-### v2.1.0 (Current)
+### v2.1.1 (Current)
+- 🎲 **random_state parameter** for reproducible results (closes #12)
+- 🔧 Controls randomness in feature subsampling (`colsample_bytree`)
+- ✅ Comprehensive reproducibility tests
+
+### v2.1.0
 - 🔍 **Feature importance** with gain-based tracking and unique per-era analysis
 - 📊 `get_feature_importance()` and `get_per_era_feature_importance()` methods
 - ✅ Comprehensive test suite comparing with LightGBM

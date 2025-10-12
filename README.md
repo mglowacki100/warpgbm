@@ -73,6 +73,7 @@ labels = model.predict(X_test)
 - 🧠 **Invariant learning via DES** — identifies signals that generalize across time/regimes/environments
 - 📈 **Smart initialization** — class priors for classification, mean for regression
 - 🎯 **Automatic label encoding** — handles strings, integers, whatever you throw at it
+- 🔍 **Feature importance** — gain-based importance with unique per-era tracking
 
 ### Training Utilities
 - ✅ **Early stopping** with validation sets
@@ -195,6 +196,46 @@ model.fit(
 # Now your model ignores spurious correlations that don't generalize!
 ```
 
+### Feature Importance: Understand Your Model
+
+```python
+from warpgbm import WarpGBM
+from sklearn.datasets import load_iris
+
+# Train a model
+iris = load_iris()
+X, y = iris.data, iris.target
+
+model = WarpGBM(objective='multiclass', max_depth=5, n_estimators=100)
+model.fit(X, y)
+
+# Get feature importance (normalized)
+importances = model.get_feature_importance()
+for name, imp in zip(iris.feature_names, importances):
+    print(f"{name}: {imp:.4f}")
+
+# Output:
+# sepal length (cm): 0.0002
+# sepal width (cm): 0.0007
+# petal length (cm): 0.1997
+# petal width (cm): 0.7994
+```
+
+**Per-Era Feature Importance (Unique to WarpGBM!)**
+
+When training with `era_id`, see which features are stable across environments:
+
+```python
+# Train with eras
+model.fit(X, y, era_id=era_labels)
+
+# Get per-era importance: shape (n_eras, n_features)
+per_era_imp = model.get_per_era_feature_importance()
+
+# Identify invariant features (high importance across ALL eras)
+invariant_features = per_era_imp.min(axis=0) > threshold
+```
+
 ### Pre-binned Data: Maximum Speed (Numerai Example)
 
 ```python
@@ -302,16 +343,25 @@ labels = model.predict(X)
 
 # Classification: returns class probabilities
 probabilities = model.predict_proba(X)  # shape: (n_samples, n_classes)
+
+# Feature importance: gain-based (like LightGBM/XGBoost)
+importances = model.get_feature_importance(normalize=True)  # sums to 1.0
+raw_gains = model.get_feature_importance(normalize=False)   # raw gain values
+
+# Per-era importance (when era_id was used in training)
+per_era_imp = model.get_per_era_feature_importance(normalize=True)  # shape: (n_eras, n_features)
 ```
 
 ### Attributes
 
 ```python
-model.classes_          # Unique class labels (classification only)
-model.num_classes       # Number of classes (classification only)
-model.forest            # Trained tree structures
-model.training_loss     # Training loss history
-model.eval_loss         # Validation loss history (if eval set provided)
+model.classes_                    # Unique class labels (classification only)
+model.num_classes                 # Number of classes (classification only)
+model.forest                      # Trained tree structures
+model.training_loss               # Training loss history
+model.eval_loss                   # Validation loss history (if eval set provided)
+model.feature_importance_         # Feature importance (sum across eras)
+model.per_era_feature_importance_ # Per-era feature importance (when era_id used)
 ```
 
 ---
@@ -380,7 +430,8 @@ Built on the shoulders of PyTorch, scikit-learn, LightGBM, XGBoost, and the CUDA
 - 📊 New metrics: log loss, accuracy
 - 🏷️ Automatic label encoding (supports strings)
 - 🔮 `predict_proba()` for probability outputs
-- ✅ Comprehensive test suite for classification
+- 🔍 **Feature importance** with gain-based tracking and unique per-era analysis
+- ✅ Comprehensive test suite for classification and feature importance
 - 🔒 Full backward compatibility with regression
 - 🐛 Fixed unused variable issue (#8)
 - 🧹 Removed unimplemented L1_reg parameter

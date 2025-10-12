@@ -70,6 +70,8 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         self.forest = [{} for _ in range(self.n_estimators)]
         self.colsample_bytree = colsample_bytree
         self.label_encoder = None
+        self.feature_importance_ = None
+        self.per_era_feature_importance_ = None
 
     def _validate_hyperparams(self, **kwargs):
         # Validate objective
@@ -505,6 +507,12 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                 self.gradients[node_indices] += self.learning_rate * leaf_value
             return {"leaf_value": leaf_value.item(), "samples": parent_size}
         
+        # Track feature importance: accumulate per-era gains for the chosen feature
+        global_feature_idx = self.feat_indices_tree[local_feature].item()
+        per_era_gains = self.per_era_gain[:, local_feature, best_bin]  # [num_eras]
+        for era_idx in range(self.num_eras):
+            self.per_era_feature_importance_[era_idx, global_feature_idx] += per_era_gains[era_idx].item()
+        
         split_mask = self.bin_indices[node_indices, self.feat_indices_tree[local_feature]] <= best_bin
         left_indices = node_indices[split_mask]
         right_indices = node_indices[~split_mask]
@@ -582,6 +590,9 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             
         self.per_era_gain = torch.zeros(self.num_eras, k, self.num_bins-1, device=self.device, dtype=torch.float32)
         self.per_era_direction = torch.zeros(self.num_eras, k, self.num_bins-1, device=self.device, dtype=torch.float32)
+        
+        # Initialize feature importance tracking
+        self.per_era_feature_importance_ = np.zeros((self.num_eras, self.num_features), dtype=np.float32)
 
         for i in range(self.n_estimators):
             self.residual = self.Y_gpu - self.gradients
@@ -604,6 +615,9 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             if self.stop:
                 break
 
+        # Aggregate feature importance across eras
+        self.feature_importance_ = self.per_era_feature_importance_.sum(axis=0)
+        
         print("Finished training forest.")
 
     def grow_forest_multiclass(self):
@@ -620,6 +634,9 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             
         self.per_era_gain = torch.zeros(self.num_eras, k, self.num_bins-1, device=self.device, dtype=torch.float32)
         self.per_era_direction = torch.zeros(self.num_eras, k, self.num_bins-1, device=self.device, dtype=torch.float32)
+        
+        # Initialize feature importance tracking
+        self.per_era_feature_importance_ = np.zeros((self.num_eras, self.num_features), dtype=np.float32)
 
         # Store K trees per iteration
         self.forest = []
@@ -667,6 +684,9 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             if self.stop:
                 break
 
+        # Aggregate feature importance across eras
+        self.feature_importance_ = self.per_era_feature_importance_.sum(axis=0)
+        
         print("Finished training multiclass forest.")
     
     def compute_eval_multiclass(self, i):
@@ -880,6 +900,77 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         # Convert logits to probabilities via softmax
         probs = softmax(F, dim=1)
         return probs
+
+    def get_feature_importance(self, importance_type='gain', normalize=True):
+        """
+        Get feature importance scores.
+        
+        Parameters:
+        -----------
+        importance_type : str, default='gain'
+            Type of importance. Currently only 'gain' is supported.
+        normalize : bool, default=True
+            If True, normalize importances to sum to 1.0
+        
+        Returns:
+        --------
+        np.ndarray
+            Array of shape (n_features,) with importance scores.
+            
+        Note:
+        -----
+        When era_id is used during training, this returns the sum of 
+        per-era importances. Use get_per_era_feature_importance() to 
+        see era-specific importances.
+        """
+        if self.feature_importance_ is None:
+            raise ValueError("Model has not been fitted yet.")
+        
+        if importance_type != 'gain':
+            raise ValueError(f"importance_type '{importance_type}' not supported. Use 'gain'.")
+        
+        importance = self.feature_importance_.copy()
+        
+        if normalize and importance.sum() > 0:
+            importance = importance / importance.sum()
+        
+        return importance
+    
+    def get_per_era_feature_importance(self, normalize=True):
+        """
+        Get per-era feature importance scores.
+        
+        Parameters:
+        -----------
+        normalize : bool, default=True
+            If True, normalize importances within each era to sum to 1.0
+        
+        Returns:
+        --------
+        np.ndarray
+            Array of shape (n_eras, n_features) with importance scores per era.
+            
+        Note:
+        -----
+        This is unique to WarpGBM's era-splitting capability. When no era_id
+        is provided during training (standard ERM setting), n_eras=1 and this
+        returns the same as get_feature_importance() but with shape (1, n_features).
+        
+        This allows you to see which features are invariant across eras vs
+        which features are only important in specific eras.
+        """
+        if self.per_era_feature_importance_ is None:
+            raise ValueError("Model has not been fitted yet.")
+        
+        importance = self.per_era_feature_importance_.copy()
+        
+        if normalize:
+            for era_idx in range(importance.shape[0]):
+                era_sum = importance[era_idx].sum()
+                if era_sum > 0:
+                    importance[era_idx] /= era_sum
+        
+        return importance
 
     def flatten_tree(self, tree, max_nodes):
         flat = torch.full((max_nodes, 6), float("nan"), dtype=torch.float32)

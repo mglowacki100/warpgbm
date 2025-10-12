@@ -246,6 +246,42 @@ For each feature bin, accumulate:
 
 **No CUDA Changes Needed**: Reuse histogram/split kernels by passing per-class g/h.
 
+### 7. Feature Importance
+
+**Gain-Based Importance**: WarpGBM tracks the total gain (loss reduction) attributable to each feature across all splits.
+
+**Implementation**:
+- `feature_importance_`: Array of shape `(n_features,)` with total gain per feature
+- `per_era_feature_importance_`: Array of shape `(n_eras, n_features)` with per-era gains
+
+**Accumulation Logic** (in `grow_tree()`):
+```python
+# When a split is accepted:
+global_feature_idx = self.feat_indices_tree[local_feature].item()
+per_era_gains = self.per_era_gain[:, local_feature, best_bin]  # [num_eras]
+
+for era_idx in range(self.num_eras):
+    self.per_era_feature_importance_[era_idx, global_feature_idx] += per_era_gains[era_idx].item()
+```
+
+**Aggregation** (after training):
+```python
+# In grow_forest() and grow_forest_multiclass():
+self.feature_importance_ = self.per_era_feature_importance_.sum(axis=0)
+```
+
+**Multiclass**: Importance is accumulated across all K trees per iteration. This means a feature used in multiple class trees gets higher importance (which is correct behavior).
+
+**Per-Era Importance**: Unique to WarpGBM! Allows identifying which features are:
+- **Invariant**: High importance across ALL eras (robust signals)
+- **Era-specific**: High importance in only some eras (potentially spurious)
+
+**API Methods**:
+- `get_feature_importance(normalize=True)`: Returns total importance across eras
+- `get_per_era_feature_importance(normalize=True)`: Returns per-era breakdown
+
+**Normalization**: When `normalize=True`, importances sum to 1.0 (per-era normalization is done independently for each era).
+
 ---
 
 ## 🔨 Development Workflow
@@ -287,13 +323,22 @@ git push -u origin feature_name
 ```bash
 # Run specific test
 pytest tests/test_multiclass.py -v
+pytest tests/test_feature_importance.py -v
 
 # Run all tests except slow ones
-pytest tests/test_fit_predict_corr.py tests/test_invariant.py -v
+pytest tests/test_fit_predict_corr.py tests/test_invariant.py tests/test_multiclass.py -v
 
-# Run all tests (slow)
+# Run all tests (slow, includes Numerai download)
 pytest tests/ -v
 ```
+
+**Test Suite Overview**:
+- `test_fit_predict_corr.py`: Basic regression functionality
+- `test_invariant.py`: Era-splitting and DES algorithm
+- `test_multiclass.py`: Classification with softmax
+- `test_comparison_lightgbm.py`: Classification predictions vs LightGBM
+- `test_feature_importance.py`: Gain-based importance and per-era tracking
+- `test_numerai_minimal_v5.py`: Integration test (slow, requires download)
 
 **Important**: Always verify regression tests still pass when adding features!
 
@@ -787,4 +832,5 @@ If you're an AI agent working on this codebase and get stuck:
 **Happy coding! 🚀**
 
 *Last updated: October 2025*
+
 

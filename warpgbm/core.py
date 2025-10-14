@@ -1,5 +1,6 @@
 import torch
 import numpy as np
+import pickle
 from sklearn.base import BaseEstimator, RegressorMixin, ClassifierMixin
 from sklearn.metrics import mean_squared_log_error
 from sklearn.preprocessing import LabelEncoder
@@ -26,6 +27,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         device="cuda",
         colsample_bytree=1.0,
         random_state=None,
+        warm_start=False,
     ):
         # Validate arguments
         self._validate_hyperparams(
@@ -71,9 +73,12 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         self.forest = [{} for _ in range(self.n_estimators)]
         self.colsample_bytree = colsample_bytree
         self.random_state = random_state
+        self.warm_start = warm_start
         self.label_encoder = None
         self.feature_importance_ = None
         self.per_era_feature_importance_ = None
+        self._is_fitted = False
+        self._trees_trained = 0  # Track number of trees already trained
 
     def _validate_hyperparams(self, **kwargs):
         # Validate objective
@@ -137,6 +142,47 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                 f"Invalid colsample_bytree: {kwargs['colsample_bytree']}. Must be a float value > 0 and <= 1."
             )
 
+    def _compute_tree_predictions(self, tree, bin_indices):
+        """
+        Compute predictions from a single tree for all samples.
+        
+        Args:
+            tree: Tree dict with structure
+            bin_indices: Binned features for samples
+        
+        Returns:
+            torch.Tensor: Predictions for each sample
+        """
+        num_samples = bin_indices.size(0)
+        predictions = torch.zeros(num_samples, device=self.device, dtype=torch.float32)
+        
+        def traverse(node, sample_mask):
+            """Recursively traverse tree and assign leaf values."""
+            if "leaf_value" in node:
+                # Leaf node: assign value to all samples in this leaf
+                predictions[sample_mask] = node["leaf_value"] * self.learning_rate
+            else:
+                # Split node: route samples left or right
+                feature_idx = node["feature"]
+                split_bin = node["bin"]
+                
+                # Samples go left if bin_value <= split_bin
+                go_left = bin_indices[sample_mask, feature_idx] <= split_bin
+                
+                left_mask = sample_mask.clone()
+                left_mask[sample_mask] = go_left
+                right_mask = sample_mask.clone()
+                right_mask[sample_mask] = ~go_left
+                
+                traverse(node["left"], left_mask)
+                traverse(node["right"], right_mask)
+        
+        # Start with all samples
+        all_samples = torch.ones(num_samples, dtype=torch.bool, device=self.device)
+        traverse(tree, all_samples)
+        
+        return predictions
+    
     def _compute_softmax_gradients_hessians(self, y_true_encoded):
         """
         Compute gradients and hessians for softmax multiclass classification.
@@ -270,16 +316,39 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                 # For full determinism, set: torch.use_deterministic_algorithms(True)
                 # but this may impact performance
 
+        # ─── Warm Start Logic ───
+        if not self.warm_start or not self._is_fitted:
+            # Fresh start: reset training state
+            self._is_fitted = False
+            self._trees_trained = 0
+            self.forest = [{} for _ in range(self.n_estimators)] if self.objective == "regression" else []
+            self.training_loss = []
+            self.eval_loss = []
+        else:
+            # Continuing training: validate that data is compatible
+            if X.shape[1] != self.num_features:
+                raise ValueError(
+                    f"X has {X.shape[1]} features, but model was trained with {self.num_features} features."
+                )
+            if self._trees_trained >= self.n_estimators:
+                # Already have all requested trees
+                print(f"Model already has {self._trees_trained} trees (n_estimators={self.n_estimators}). No additional training needed.")
+                return self
+
         if era_id is None:
             era_id = np.ones(X.shape[0], dtype="int32")
 
         # ─── Handle multiclass vs regression ───
         if self.objective == "multiclass" or self.objective == "binary":
             # Encode labels
-            self.label_encoder = LabelEncoder()
-            y_encoded = self.label_encoder.fit_transform(y)
-            self.classes_ = self.label_encoder.classes_
-            self.num_classes = len(self.classes_)
+            if not self.warm_start or not self._is_fitted:
+                self.label_encoder = LabelEncoder()
+                y_encoded = self.label_encoder.fit_transform(y)
+                self.classes_ = self.label_encoder.classes_
+                self.num_classes = len(self.classes_)
+            else:
+                # Warm start: use existing label encoder
+                y_encoded = self.label_encoder.transform(y)
             
             if self.objective == "binary" and self.num_classes != 2:
                 raise ValueError(f"binary objective requires exactly 2 classes, got {self.num_classes}")
@@ -302,10 +371,23 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         self.num_samples, self.num_features = X.shape
         self.num_eras = len(self.unique_eras)
         self.era_indices = self.era_indices.to(dtype=torch.int32)
-        self.gradients = torch.zeros_like(self.Y_gpu)
+        
+        # Initialize gradients (predictions)
+        if self.warm_start and self._is_fitted and self._trees_trained > 0:
+            # Warm start: restore predictions from existing forest
+            self.gradients = torch.zeros_like(self.Y_gpu) + self.base_prediction
+            # Add predictions from existing trees
+            for tree in self.forest[:self._trees_trained]:
+                if tree:
+                    leaf_updates = self._compute_tree_predictions(tree, self.bin_indices)
+                    self.gradients += leaf_updates
+        else:
+            # Fresh start
+            self.gradients = torch.zeros_like(self.Y_gpu)
+            self.base_prediction = self.Y_gpu.mean().item()
+            self.gradients += self.base_prediction
+        
         self.root_node_indices = torch.arange(self.num_samples, device=self.device, dtype=torch.int32)
-        self.base_prediction = self.Y_gpu.mean().item()
-        self.gradients += self.base_prediction
         self.feature_indices = torch.arange(self.num_features, device=self.device, dtype=torch.int32)
 
         # ─── Optional Eval Set ───
@@ -346,14 +428,32 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         self.Y_gpu = torch.from_numpy(y_encoded).to(torch.int32).to(self.device)
         
         # Initialize scores F[i,k] - shape (N, K)
-        self.gradients = torch.zeros((self.num_samples, self.num_classes), 
-                                     dtype=torch.float32, device=self.device)
-        
-        # Initialize with class priors (optional but helps convergence)
-        for k in range(self.num_classes):
-            prior_k = (self.Y_gpu == k).float().mean()
-            if prior_k > 0:
-                self.gradients[:, k] = torch.log(prior_k + 1e-10)
+        if self.warm_start and self._is_fitted and self._trees_trained > 0:
+            # Warm start: restore predictions from existing forest
+            self.gradients = torch.zeros((self.num_samples, self.num_classes), 
+                                         dtype=torch.float32, device=self.device)
+            # Initialize with class priors
+            for k in range(self.num_classes):
+                prior_k = (self.Y_gpu == k).float().mean()
+                if prior_k > 0:
+                    self.gradients[:, k] = torch.log(prior_k + 1e-10)
+            
+            # Add predictions from existing trees
+            for round_trees in self.forest[:self._trees_trained]:
+                for class_k, tree in enumerate(round_trees):
+                    if tree:
+                        leaf_updates = self._compute_tree_predictions(tree, self.bin_indices)
+                        self.gradients[:, class_k] += leaf_updates
+        else:
+            # Fresh start
+            self.gradients = torch.zeros((self.num_samples, self.num_classes), 
+                                         dtype=torch.float32, device=self.device)
+            
+            # Initialize with class priors (optional but helps convergence)
+            for k in range(self.num_classes):
+                prior_k = (self.Y_gpu == k).float().mean()
+                if prior_k > 0:
+                    self.gradients[:, k] = torch.log(prior_k + 1e-10)
         
         self.root_node_indices = torch.arange(self.num_samples, device=self.device, dtype=torch.int32)
         self.feature_indices = torch.arange(self.num_features, device=self.device, dtype=torch.int32)
@@ -591,8 +691,12 @@ class WarpGBM(BaseEstimator, RegressorMixin):
 
     def grow_forest(self):
         """Regression forest growing (original logic)"""
-        self.training_loss = []
-        self.eval_loss = []  # if eval set is given
+        # Warm start: preserve existing training state
+        if not hasattr(self, 'training_loss') or not self.warm_start or not self._is_fitted:
+            self.training_loss = []
+            self.eval_loss = []  # if eval set is given
+            self.per_era_feature_importance_ = np.zeros((self.num_eras, self.num_features), dtype=np.float32)
+        
         self.stop = False
 
         if self.colsample_bytree < 1.0:
@@ -603,11 +707,15 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             
         self.per_era_gain = torch.zeros(self.num_eras, k, self.num_bins-1, device=self.device, dtype=torch.float32)
         self.per_era_direction = torch.zeros(self.num_eras, k, self.num_bins-1, device=self.device, dtype=torch.float32)
-        
-        # Initialize feature importance tracking
-        self.per_era_feature_importance_ = np.zeros((self.num_eras, self.num_features), dtype=np.float32)
 
-        for i in range(self.n_estimators):
+        # Warm start: start from where we left off
+        start_iter = self._trees_trained if self.warm_start and self._is_fitted else 0
+        
+        # Ensure forest has enough slots
+        if len(self.forest) < self.n_estimators:
+            self.forest.extend([{} for _ in range(self.n_estimators - len(self.forest))])
+
+        for i in range(start_iter, self.n_estimators):
             self.residual = self.Y_gpu - self.gradients
 
             if self.colsample_bytree < 1.0:
@@ -622,6 +730,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                 0,
             )
             self.forest[i] = tree
+            self._trees_trained = i + 1
 
             self.compute_eval(i)
 
@@ -630,13 +739,20 @@ class WarpGBM(BaseEstimator, RegressorMixin):
 
         # Aggregate feature importance across eras
         self.feature_importance_ = self.per_era_feature_importance_.sum(axis=0)
+        self._is_fitted = True
         
-        print("Finished training forest.")
+        print(f"Finished training forest. Total trees: {self._trees_trained}")
 
     def grow_forest_multiclass(self):
         """Multiclass forest growing - K trees per iteration"""
-        self.training_loss = []
-        self.eval_loss = []
+        # Warm start: preserve existing training state
+        if not hasattr(self, 'training_loss') or not self.warm_start or not self._is_fitted:
+            self.training_loss = []
+            self.eval_loss = []
+            self.per_era_feature_importance_ = np.zeros((self.num_eras, self.num_features), dtype=np.float32)
+            # Store K trees per iteration
+            self.forest = []
+        
         self.stop = False
 
         if self.colsample_bytree < 1.0:
@@ -647,14 +763,11 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             
         self.per_era_gain = torch.zeros(self.num_eras, k, self.num_bins-1, device=self.device, dtype=torch.float32)
         self.per_era_direction = torch.zeros(self.num_eras, k, self.num_bins-1, device=self.device, dtype=torch.float32)
-        
-        # Initialize feature importance tracking
-        self.per_era_feature_importance_ = np.zeros((self.num_eras, self.num_features), dtype=np.float32)
 
-        # Store K trees per iteration
-        self.forest = []
+        # Warm start: start from where we left off
+        start_iter = self._trees_trained if self.warm_start and self._is_fitted else 0
 
-        for i in range(self.n_estimators):
+        for i in range(start_iter, self.n_estimators):
             # Compute softmax probabilities and gradients/hessians for all classes
             grads, hess = self._compute_softmax_gradients_hessians(self.Y_gpu)
             
@@ -691,6 +804,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                 trees_k.append(tree_k)
             
             self.forest.append(trees_k)
+            self._trees_trained = i + 1
             
             self.compute_eval_multiclass(i)
 
@@ -699,8 +813,9 @@ class WarpGBM(BaseEstimator, RegressorMixin):
 
         # Aggregate feature importance across eras
         self.feature_importance_ = self.per_era_feature_importance_.sum(axis=0)
+        self._is_fitted = True
         
-        print("Finished training multiclass forest.")
+        print(f"Finished training multiclass forest. Total rounds: {self._trees_trained} ({self._trees_trained * self.num_classes} trees)")
     
     def compute_eval_multiclass(self, i):
         """Evaluation for multiclass"""
@@ -984,6 +1099,118 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                     importance[era_idx] /= era_sum
         
         return importance
+
+    def save_model(self, path):
+        """
+        Save the trained model to disk for later use.
+        
+        Parameters:
+        -----------
+        path : str
+            File path where the model will be saved (e.g., 'model.pkl')
+        
+        Example:
+        --------
+        >>> model = WarpGBM(n_estimators=100)
+        >>> model.fit(X_train, y_train)
+        >>> model.save_model('checkpoint_100.pkl')
+        """
+        if not self._is_fitted:
+            raise ValueError("Cannot save unfitted model. Call fit() first.")
+        
+        # Collect all the necessary state to save
+        state = {
+            # Hyperparameters
+            'objective': self.objective,
+            'num_bins': self.num_bins,
+            'max_depth': self.max_depth,
+            'learning_rate': self.learning_rate,
+            'n_estimators': self.n_estimators,
+            'min_child_weight': self.min_child_weight,
+            'min_split_gain': self.min_split_gain,
+            'L2_reg': self.L2_reg,
+            'colsample_bytree': self.colsample_bytree,
+            'random_state': self.random_state,
+            'warm_start': self.warm_start,
+            
+            # Trained state
+            'forest': self.forest,
+            'bin_edges': self.bin_edges,
+            'base_prediction': self.base_prediction,
+            'num_features': self.num_features,
+            'num_classes': self.num_classes,
+            'classes_': self.classes_,
+            'label_encoder': self.label_encoder,
+            'feature_importance_': self.feature_importance_,
+            'per_era_feature_importance_': self.per_era_feature_importance_,
+            '_is_fitted': self._is_fitted,
+            '_trees_trained': self._trees_trained,
+            'training_loss': self.training_loss if hasattr(self, 'training_loss') else [],
+            'eval_loss': self.eval_loss if hasattr(self, 'eval_loss') else [],
+        }
+        
+        with open(path, 'wb') as f:
+            pickle.dump(state, f)
+        
+        print(f"Model saved to {path}")
+    
+    def load_model(self, path):
+        """
+        Load a previously saved model from disk.
+        
+        Parameters:
+        -----------
+        path : str
+            File path to the saved model (e.g., 'model.pkl')
+        
+        Returns:
+        --------
+        self : WarpGBM
+            The model instance with loaded state
+        
+        Example:
+        --------
+        >>> model = WarpGBM()
+        >>> model.load_model('checkpoint_100.pkl')
+        >>> # Continue training with warm_start
+        >>> model.warm_start = True
+        >>> model.n_estimators = 200  # Train 100 more trees
+        >>> model.fit(X_train, y_train)
+        """
+        with open(path, 'rb') as f:
+            state = pickle.load(f)
+        
+        # Restore hyperparameters
+        self.objective = state['objective']
+        self.num_bins = state['num_bins']
+        self.max_depth = state['max_depth']
+        self.learning_rate = state['learning_rate']
+        self.n_estimators = state['n_estimators']
+        self.min_child_weight = state['min_child_weight']
+        self.min_split_gain = state['min_split_gain']
+        self.L2_reg = state['L2_reg']
+        self.colsample_bytree = state['colsample_bytree']
+        self.random_state = state['random_state']
+        self.warm_start = state['warm_start']
+        
+        # Restore trained state
+        self.forest = state['forest']
+        self.bin_edges = state['bin_edges']
+        self.base_prediction = state['base_prediction']
+        self.num_features = state['num_features']
+        self.num_classes = state['num_classes']
+        self.classes_ = state['classes_']
+        self.label_encoder = state['label_encoder']
+        self.feature_importance_ = state['feature_importance_']
+        self.per_era_feature_importance_ = state['per_era_feature_importance_']
+        self._is_fitted = state['_is_fitted']
+        self._trees_trained = state['_trees_trained']
+        self.training_loss = state.get('training_loss', [])
+        self.eval_loss = state.get('eval_loss', [])
+        
+        print(f"Model loaded from {path} ({self._trees_trained} trees)")
+        
+        return self
 
     def flatten_tree(self, tree, max_nodes):
         flat = torch.full((max_nodes, 6), float("nan"), dtype=torch.float32)

@@ -284,6 +284,128 @@ self.feature_importance_ = self.per_era_feature_importance_.sum(axis=0)
 
 ---
 
+## 💾 Warm Start & Checkpointing
+
+**Purpose**: Enable incremental training and model checkpointing for iterative development, hyperparameter tuning, and production workflows.
+
+### Implementation Details
+
+**Key Components**:
+1. `warm_start` parameter (bool, default `False`)
+2. `_is_fitted` flag to track if model has been trained
+3. `_trees_trained` counter to track number of trees already trained
+4. `save_model()` and `load_model()` methods for serialization
+
+### How Warm Start Works
+
+**Without warm_start** (default):
+```python
+model = WarpGBM(n_estimators=100)
+model.fit(X, y)  # Trains 100 trees
+model.fit(X, y)  # Retrains from scratch, 100 new trees
+```
+
+**With warm_start**:
+```python
+model = WarpGBM(n_estimators=50, warm_start=True)
+model.fit(X, y)  # Trains 50 trees
+model.n_estimators = 100
+model.fit(X, y)  # Adds 50 more trees (total: 100)
+```
+
+### Critical Implementation Detail: Gradient Restoration
+
+**The Challenge**: When continuing training, we must restore `self.gradients` (the accumulated predictions) from the existing forest. Otherwise, new trees would be trained as if no previous trees exist.
+
+**Solution** (in `_fit_regression` and `_fit_classification`):
+
+```python
+if self.warm_start and self._is_fitted and self._trees_trained > 0:
+    # Restore predictions from existing forest
+    self.gradients = torch.zeros_like(self.Y_gpu) + self.base_prediction
+    
+    # For regression: add predictions from each existing tree
+    for tree in self.forest[:self._trees_trained]:
+        if tree:
+            leaf_updates = self._compute_tree_predictions(tree, self.bin_indices)
+            self.gradients += leaf_updates
+    
+    # For classification: same but per-class
+    for round_trees in self.forest[:self._trees_trained]:
+        for class_k, tree in enumerate(round_trees):
+            if tree:
+                leaf_updates = self._compute_tree_predictions(tree, self.bin_indices)
+                self.gradients[:, class_k] += leaf_updates
+```
+
+**Helper Method**: `_compute_tree_predictions(tree, bin_indices)`
+- Traverses tree structure recursively
+- Assigns leaf values to samples based on splits
+- Returns tensor of predictions for all samples
+
+### Save/Load Implementation
+
+**save_model()**:
+- Pickles all model state (hyperparameters + trained state)
+- Includes: `forest`, `bin_edges`, `base_prediction`, `label_encoder`, feature importances, `_trees_trained`, etc.
+- Uses standard Python pickle (simple, portable)
+
+**load_model()**:
+- Restores all state from pickle file
+- User can then:
+  - Use for predictions immediately
+  - Enable `warm_start` and continue training
+  - Modify `n_estimators` to add more trees
+
+### Test Strategy
+
+**test_warm_start.py** covers:
+1. **Equivalence**: Train 100 trees at once vs 50+50 with warm_start → identical predictions
+2. **Save/Load**: Predictions before and after save/load are identical
+3. **Resume Training**: Load checkpoint, continue training, verify correctness
+4. **Both objectives**: Regression and multiclass classification
+5. **Feature Importance**: Accumulated correctly across warm start sessions
+
+### Usage Examples
+
+**Incremental Training**:
+```python
+model = WarpGBM(n_estimators=50, warm_start=True)
+model.fit(X, y)
+# Evaluate, decide if more trees needed
+model.n_estimators = 100
+model.fit(X, y)  # Trains 50 more
+```
+
+**Checkpointing**:
+```python
+model = WarpGBM(n_estimators=200, warm_start=True)
+for checkpoint in [50, 100, 150, 200]:
+    model.n_estimators = checkpoint
+    model.fit(X_train, y_train)
+    model.save_model(f'ckpt_{checkpoint}.pkl')
+    eval_score = evaluate(model, X_val, y_val)
+    print(f"Checkpoint {checkpoint}: {eval_score:.4f}")
+```
+
+**Load and Resume**:
+```python
+model = WarpGBM()
+model.load_model('ckpt_100.pkl')  # Has 100 trees
+model.warm_start = True
+model.n_estimators = 200  # Train 100 more
+model.fit(X, y)
+```
+
+### Design Notes
+
+- **Sklearn-compatible**: Matches sklearn's `warm_start` API
+- **No CUDA state saved**: Trees are Python dicts, no GPU tensors in checkpoint
+- **Backward compatible**: Default `warm_start=False` maintains existing behavior
+- **Works with all objectives**: Regression, binary, multiclass
+
+---
+
 ## 🔨 Development Workflow
 
 ### Environment Setup
@@ -338,6 +460,8 @@ pytest tests/ -v
 - `test_multiclass.py`: Classification with softmax
 - `test_comparison_lightgbm.py`: Classification predictions vs LightGBM
 - `test_feature_importance.py`: Gain-based importance and per-era tracking
+- `test_random_state.py`: Reproducibility with random_state parameter
+- `test_warm_start.py`: Incremental training, save/load, and checkpointing
 - `test_numerai_minimal_v5.py`: Integration test (slow, requires download)
 
 **Important**: Always verify regression tests still pass when adding features!

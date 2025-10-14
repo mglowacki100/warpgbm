@@ -80,6 +80,7 @@ labels = model.predict(X_test)
 - 📊 **Rich metrics**: MSE, RMSLE, correlation, log loss, accuracy
 - 🔍 **Progress tracking** with loss curves
 - 🎚️ **Regularization** — L2 leaf penalties, min split gain, min child weight
+- 💾 **Warm start & checkpointing** — save/load models, incremental training
 
 ---
 
@@ -236,6 +237,47 @@ per_era_imp = model.get_per_era_feature_importance()
 invariant_features = per_era_imp.min(axis=0) > threshold
 ```
 
+### Warm Start: Incremental Training & Checkpointing
+
+Train a model in stages, save checkpoints, and resume training later:
+
+```python
+from warpgbm import WarpGBM
+import numpy as np
+
+# Train 50 trees
+model = WarpGBM(
+    objective='regression',
+    n_estimators=50,
+    max_depth=5,
+    learning_rate=0.1,
+    warm_start=True  # Enable incremental training
+)
+model.fit(X, y)
+predictions_50 = model.predict(X_test)
+
+# Save checkpoint
+model.save_model('checkpoint_50.pkl')
+
+# Continue training for 50 more trees (total: 100)
+model.n_estimators = 100
+model.fit(X, y)  # Adds 50 trees on top of existing 50
+predictions_100 = model.predict(X_test)
+
+# Or load and continue training later
+model_loaded = WarpGBM()
+model_loaded.load_model('checkpoint_50.pkl')
+model_loaded.warm_start = True
+model_loaded.n_estimators = 100
+model_loaded.fit(X, y)  # Resumes from 50 → 100 trees
+```
+
+**Use Cases:**
+- **Hyperparameter tuning**: Train to 50 trees, evaluate, decide if you need 100 or 200
+- **Checkpointing**: Save progress during long training runs
+- **Iterative development**: Add more trees without retraining from scratch
+- **Production updates**: Retrain models incrementally as new data arrives
+
 ### Pre-binned Data: Maximum Speed (Numerai Example)
 
 ```python
@@ -312,6 +354,7 @@ WarpGBM(
     L2_reg=1e-6,                   # L2 leaf regularization
     colsample_bytree=1.0,          # Feature subsample ratio per tree
     random_state=None,             # Random seed for reproducibility
+    warm_start=False,              # If True, continue training from existing trees
     threads_per_block=64,          # CUDA block size (tune for your GPU)
     rows_per_thread=4,             # Rows processed per thread
     device='cuda'                  # 'cuda' or 'cpu' (GPU strongly recommended)
@@ -333,7 +376,7 @@ model.fit(
 )
 ```
 
-### Prediction Methods
+### Prediction & Utility Methods
 
 ```python
 # Regression: returns predicted values
@@ -351,6 +394,11 @@ raw_gains = model.get_feature_importance(normalize=False)   # raw gain values
 
 # Per-era importance (when era_id was used in training)
 per_era_imp = model.get_per_era_feature_importance(normalize=True)  # shape: (n_eras, n_features)
+
+# Save and load models
+model.save_model('checkpoint.pkl')  # Saves all model state
+model_loaded = WarpGBM()
+model_loaded.load_model('checkpoint.pkl')  # Restores everything
 ```
 
 ### Attributes
@@ -425,7 +473,14 @@ Built on the shoulders of PyTorch, scikit-learn, LightGBM, XGBoost, and the CUDA
 
 ## 📝 Version History
 
-### v2.1.1 (Current)
+### v2.2.0 (Current)
+- 💾 **Warm start support** for incremental training (closes #14)
+- 📦 `save_model()` and `load_model()` methods for checkpointing
+- 🔄 Resume training from saved models with `warm_start=True`
+- ✅ Comprehensive test suite for warm start and save/load functionality
+- 📚 Updated documentation with warm start examples
+
+### v2.1.1
 - 🎲 **random_state parameter** for reproducible results (closes #12)
 - 🔧 Controls randomness in feature subsampling (`colsample_bytree`)
 - ✅ Comprehensive reproducibility tests

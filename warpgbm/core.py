@@ -691,45 +691,46 @@ class WarpGBM(BaseEstimator, RegressorMixin):
     
     
     def grow_forest(self):
-        """Zoptymalizowany Fibonacci Momentum Grow Forest z poprawką błędu"""
+        """Zoptymalizowany Fibonacci Momentum z kompletną inicjalizacją"""
+        # 1. Podstawowa inicjalizacja struktur danych
         if not hasattr(self, 'training_loss') or not self.warm_start or not self._is_fitted:
             self.training_loss, self.eval_loss = [], []
             self.per_era_feature_importance_ = np.zeros((self.num_eras, self.num_features), dtype=np.float32)
-            # KLUCZOWA INICJALIZACJA:
-            self.feat_indices_tree = self.feature_indices 
+            self.feat_indices_tree = self.feature_indices
+            self._is_fitted = False
+
+        # 2. INICJALIZACJA TENSORÓW PER_ERA (Naprawa błędu)
+        # Te tensory są niezbędne dla algorytmu WarpGBM do śledzenia zysku w każdej erze
+        k = max(1, int(self.colsample_bytree * self.num_features)) if self.colsample_bytree < 1.0 else self.num_features
         
+        self.per_era_gain = torch.zeros(self.num_eras, k, self.num_bins-1, device=self.device, dtype=torch.float32)
+        self.per_era_direction = torch.zeros(self.num_eras, k, self.num_bins-1, device=self.device, dtype=torch.float32)
+
+        # 3. Logika Fibonacciego
         phi = (1 + 5**0.5) / 2
         alpha1, alpha2 = phi / (1 + phi), 1 / (1 + phi)
 
-        # Inicjalizacja bufora pamięci m2
         if not hasattr(self, '_gradients_m2'):
              self._gradients_m2 = self.gradients.clone() 
 
         start_iter = self._trees_trained if self.warm_start and self._is_fitted else 0
-        k = max(1, int(self.colsample_bytree * self.num_features))
-        
-        # Jeśli nie używamy colsample, ustawiamy pełne indeksy raz przed pętlą
-        if self.colsample_bytree >= 1.0:
-            self.feat_indices_tree = self.feature_indices
+        self.stop = False
 
+        # 4. Pętla treningowa
         for i in range(start_iter, self.n_estimators):
-            # 1. Golden Reference
+            # Fibonacci Reference Point
             if i > 1:
                 golden_ref = alpha1 * self.gradients + alpha2 * self._gradients_m2
             else:
                 golden_ref = self.gradients
 
-            # 2. Residua
             self.residual = self.Y_gpu - golden_ref
-            
-            # Zapamiętujemy stan przed aktualizacją
             old_m1 = self.gradients.clone()
 
-            # 3. Wybór cech (jeśli używamy colsampling)
             if self.colsample_bytree < 1.0:
                 self.feat_indices_tree = torch.randperm(self.num_features, device=self.device, dtype=torch.int32)[:k]
 
-            # TERAZ self.feat_indices_tree zawsze istnieje
+            # Obliczanie histogramów (tu WarpGBM używa per_era_gain)
             self.root_gradient_histogram, self.root_hessian_histogram = self.compute_histograms(
                 self.root_node_indices, self.feat_indices_tree
             )

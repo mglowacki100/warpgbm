@@ -688,66 +688,128 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             )
 
             del eval_preds, eval_loss, train_loss
-            
+    
+    
     def grow_forest(self):
-        """Zoptymalizowany Fibonacci Momentum Grow Forest dla WarpGBM"""
+        """Zoptymalizowany Fibonacci Momentum Grow Forest z poprawką błędu"""
         if not hasattr(self, 'training_loss') or not self.warm_start or not self._is_fitted:
             self.training_loss, self.eval_loss = [], []
             self.per_era_feature_importance_ = np.zeros((self.num_eras, self.num_features), dtype=np.float32)
+            # KLUCZOWA INICJALIZACJA:
+            self.feat_indices_tree = self.feature_indices 
         
         phi = (1 + 5**0.5) / 2
         alpha1, alpha2 = phi / (1 + phi), 1 / (1 + phi)
-    
+
         # Inicjalizacja bufora pamięci m2
-        # self.gradients w WarpGBM to F_{m-1} (bieżąca suma predykcji)
-        gradients_m2 = self.gradients.clone() 
-    
+        if not hasattr(self, '_gradients_m2'):
+             self._gradients_m2 = self.gradients.clone() 
+
         start_iter = self._trees_trained if self.warm_start and self._is_fitted else 0
-        k = max(1, int(self.colsample_bytree * self.num_features)) if self.colsample_bytree < 1.0 else self.num_features
-    
+        k = max(1, int(self.colsample_bytree * self.num_features))
+        
+        # Jeśli nie używamy colsample, ustawiamy pełne indeksy raz przed pętlą
+        if self.colsample_bytree >= 1.0:
+            self.feat_indices_tree = self.feature_indices
+
         for i in range(start_iter, self.n_estimators):
-            # 1. Obliczamy Golden Reference (Punkt Bazowy)
+            # 1. Golden Reference
             if i > 1:
-                # f_m1 to self.gradients, f_m2 to nasz bufor
-                golden_ref = alpha1 * self.gradients + alpha2 * gradients_m2
+                golden_ref = alpha1 * self.gradients + alpha2 * self._gradients_m2
             else:
                 golden_ref = self.gradients
-    
-            # 2. Obliczamy residua względem wygładzonej trajektorii
+
+            # 2. Residua
             self.residual = self.Y_gpu - golden_ref
             
-            # Zapamiętujemy obecny stan m1 przed aktualizacją, by stał się m2
+            # Zapamiętujemy stan przed aktualizacją
             old_m1 = self.gradients.clone()
-    
-            # 3. Standardowa logika WarpGBM: Budowa drzewa
+
+            # 3. Wybór cech (jeśli używamy colsampling)
             if self.colsample_bytree < 1.0:
                 self.feat_indices_tree = torch.randperm(self.num_features, device=self.device, dtype=torch.int32)[:k]
-            
+
+            # TERAZ self.feat_indices_tree zawsze istnieje
             self.root_gradient_histogram, self.root_hessian_histogram = self.compute_histograms(
                 self.root_node_indices, self.feat_indices_tree
             )
-    
+
             tree = self.grow_tree(
                 self.root_gradient_histogram, self.root_hessian_histogram,
                 self.root_node_indices, 0
             )
-    
-            # 4. AKTUALIZACJA: self.gradients staje się F_m
-            # W WarpGBM update dzieje się zazwyczaj wewnątrz grow_tree lub bezpośrednio po
-            # Musimy upewnić się, że self.gradients po tym kroku to GoldenRef + learning_rate * tree_preds
-            # Pamiętaj, by WarpGBM dodawał predykcje drzewa do GoldenRef, a nie do self.gradients!
-            
-            gradients_m2 = old_m1 # Przesuwamy okno
+
+            self._gradients_m2 = old_m1 
             self.forest[i] = tree
             self._trees_trained = i + 1
             self.compute_eval(i)
-    
+
             if self.stop: break
-    
+
         self.feature_importance_ = self.per_era_feature_importance_.sum(axis=0)
         self._is_fitted = True
+        print(f"Finished training fibonacci momentum forest. Total trees: {self._trees_trained}")    
+    
+    
+    # def grow_forest(self):
+    #     """Zoptymalizowany Fibonacci Momentum Grow Forest dla WarpGBM"""
+    #     if not hasattr(self, 'training_loss') or not self.warm_start or not self._is_fitted:
+    #         self.training_loss, self.eval_loss = [], []
+    #         self.per_era_feature_importance_ = np.zeros((self.num_eras, self.num_features), dtype=np.float32)
         
-        print(f"Finished training fibonacci momentum forest. Total trees: {self._trees_trained}")
+    #     phi = (1 + 5**0.5) / 2
+    #     alpha1, alpha2 = phi / (1 + phi), 1 / (1 + phi)
+    
+    #     # Inicjalizacja bufora pamięci m2
+    #     # self.gradients w WarpGBM to F_{m-1} (bieżąca suma predykcji)
+    #     gradients_m2 = self.gradients.clone() 
+    
+    #     start_iter = self._trees_trained if self.warm_start and self._is_fitted else 0
+    #     k = max(1, int(self.colsample_bytree * self.num_features)) if self.colsample_bytree < 1.0 else self.num_features
+    
+    #     for i in range(start_iter, self.n_estimators):
+    #         # 1. Obliczamy Golden Reference (Punkt Bazowy)
+    #         if i > 1:
+    #             # f_m1 to self.gradients, f_m2 to nasz bufor
+    #             golden_ref = alpha1 * self.gradients + alpha2 * gradients_m2
+    #         else:
+    #             golden_ref = self.gradients
+    
+    #         # 2. Obliczamy residua względem wygładzonej trajektorii
+    #         self.residual = self.Y_gpu - golden_ref
+            
+    #         # Zapamiętujemy obecny stan m1 przed aktualizacją, by stał się m2
+    #         old_m1 = self.gradients.clone()
+    
+    #         # 3. Standardowa logika WarpGBM: Budowa drzewa
+    #         if self.colsample_bytree < 1.0:
+    #             self.feat_indices_tree = torch.randperm(self.num_features, device=self.device, dtype=torch.int32)[:k]
+            
+    #         self.root_gradient_histogram, self.root_hessian_histogram = self.compute_histograms(
+    #             self.root_node_indices, self.feat_indices_tree
+    #         )
+    
+    #         tree = self.grow_tree(
+    #             self.root_gradient_histogram, self.root_hessian_histogram,
+    #             self.root_node_indices, 0
+    #         )
+    
+    #         # 4. AKTUALIZACJA: self.gradients staje się F_m
+    #         # W WarpGBM update dzieje się zazwyczaj wewnątrz grow_tree lub bezpośrednio po
+    #         # Musimy upewnić się, że self.gradients po tym kroku to GoldenRef + learning_rate * tree_preds
+    #         # Pamiętaj, by WarpGBM dodawał predykcje drzewa do GoldenRef, a nie do self.gradients!
+            
+    #         gradients_m2 = old_m1 # Przesuwamy okno
+    #         self.forest[i] = tree
+    #         self._trees_trained = i + 1
+    #         self.compute_eval(i)
+    
+    #         if self.stop: break
+    
+    #     self.feature_importance_ = self.per_era_feature_importance_.sum(axis=0)
+    #     self._is_fitted = True
+        
+    #     print(f"Finished training fibonacci momentum forest. Total trees: {self._trees_trained}")
                 
     # def grow_forest(self):
     #     """Regression forest growing with Fibonacci Flow"""

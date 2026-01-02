@@ -688,16 +688,19 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             )
 
             del eval_preds, eval_loss, train_loss
-
+            
     def grow_forest(self):
-        """Regression forest growing (original logic)"""
-        # Warm start: preserve existing training state
+        """Regression forest growing with Fibonacci Flow"""
         if not hasattr(self, 'training_loss') or not self.warm_start or not self._is_fitted:
             self.training_loss = []
-            self.eval_loss = []  # if eval set is given
+            self.eval_loss = []
             self.per_era_feature_importance_ = np.zeros((self.num_eras, self.num_features), dtype=np.float32)
         
         self.stop = False
+        
+        phi = (1 + 5**0.5) / 2
+        alpha1 = phi / (1 + phi)  # ~0.618
+        alpha2 = 1 / (1 + phi)    # ~0.382
 
         if self.colsample_bytree < 1.0:
             k = max(1, int(self.colsample_bytree * self.num_features))
@@ -708,20 +711,36 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         self.per_era_gain = torch.zeros(self.num_eras, k, self.num_bins-1, device=self.device, dtype=torch.float32)
         self.per_era_direction = torch.zeros(self.num_eras, k, self.num_bins-1, device=self.device, dtype=torch.float32)
 
-        # Warm start: start from where we left off
+        # Init memory states for fibo
+        # self.gradients -> F_{m-1}
+        # additional buffer for F_{m-2}
+        gradients_m2 = self.gradients.clone() 
+
         start_iter = self._trees_trained if self.warm_start and self._is_fitted else 0
         
-        # Ensure forest has enough slots
         if len(self.forest) < self.n_estimators:
             self.forest.extend([{} for _ in range(self.n_estimators - len(self.forest))])
 
         for i in range(start_iter, self.n_estimators):
-            self.residual = self.Y_gpu - self.gradients
+            #FIBONACCI RECURSIVE DYNAMICS ---
+            if i > 1:
+
+                # F_ensemble = alpha1 * F_{m-1} + alpha2 * F_{m-2}
+                combined_state = alpha1 * self.gradients + alpha2 * gradients_m2
+                self.residual = self.Y_gpu - combined_state
+            else:
+
+                self.residual = self.Y_gpu - self.gradients
+
+            # remember current m2 for next iteration
+            old_gradients_m1 = self.gradients.clone()
 
             if self.colsample_bytree < 1.0:
                 self.feat_indices_tree = torch.randperm(self.num_features, device=self.device, dtype=torch.int32)[:k]
 
-            self.root_gradient_histogram, self.root_hessian_histogram = self.compute_histograms( self.root_node_indices, self.feat_indices_tree )
+            self.root_gradient_histogram, self.root_hessian_histogram = self.compute_histograms(
+                self.root_node_indices, self.feat_indices_tree
+            )
 
             tree = self.grow_tree(
                 self.root_gradient_histogram,
@@ -729,19 +748,112 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                 self.root_node_indices,
                 0,
             )
+
+            gradients_m2 = old_gradients_m1
+
             self.forest[i] = tree
             self._trees_trained = i + 1
-
             self.compute_eval(i)
 
             if self.stop:
                 break
 
-        # Aggregate feature importance across eras
         self.feature_importance_ = self.per_era_feature_importance_.sum(axis=0)
         self._is_fitted = True
         
-        print(f"Finished training forest. Total trees: {self._trees_trained}")
+        print(f"Finished training fibonacci forest. Total trees: {self._trees_trained}")
+    
+        
+    # def grow_forest_fibonacci_momentum(self, X, y, num_trees):
+    #     phi = (1 + 5**0.5) / 2
+    #     # Współczynniki Fibonacciego (alpha1 + alpha2 = 1)
+    #     alpha1 = phi / (1 + phi)  # ~0.618 (pamięć bliska)
+    #     alpha2 = 1 / (1 + phi)    # ~0.382 (pamięć daleka)
+        
+    #     # Inicjalizacja stanów (predykcje na zbiorze X)
+    #     f_m2 = torch.full((X.shape[0],), self.base_prediction, device=self.device)
+    #     f_m1 = f_m2.clone()
+        
+    #     for i in range(num_trees):
+    #         # 1. Obliczamy "Złoty Punkt Bazowy" (Golden Reference)
+    #         # To jest moment, w którym adresujemy "nieciągłość" - 
+    #         # łączymy dwa poprzednie stany, co wygładza skoki między partycjami.
+    #         if i < 2:
+    #             golden_ref = f_m1
+    #         else:
+    #             golden_ref = alpha1 * f_m1 + alpha2 * f_m2
+                
+    #         # 2. Obliczamy Gradienty (Residua) względem Golden Reference
+    #         # Nie uczymy się na f_m1, ale na uśrednionej trajektorii
+    #         gradients = self.loss_function.gradient(y, golden_ref)
+            
+    #         # 3. Trenujemy nowe drzewo (WarpGBM standard logic)
+    #         # Drzewo stara się wypełnić lukę między "Złotą Średnią" a Targetem
+    #         new_tree = self.build_tree(X, gradients)
+            
+    #         # 4. Update modelu (z learning rate)
+    #         h_i = self.learning_rate * new_tree.predict(X)
+    #         f_next = golden_ref + h_i
+            
+    #         # 5. Przesunięcie okna pamięci
+    #         f_m2 = f_m1
+    #         f_m1 = f_next
+            
+    #         self.forest.append(new_tree)
+        
+    # def grow_forest(self):
+    #     """Regression forest growing (original logic)"""
+    #     # Warm start: preserve existing training state
+    #     if not hasattr(self, 'training_loss') or not self.warm_start or not self._is_fitted:
+    #         self.training_loss = []
+    #         self.eval_loss = []  # if eval set is given
+    #         self.per_era_feature_importance_ = np.zeros((self.num_eras, self.num_features), dtype=np.float32)
+        
+    #     self.stop = False
+
+    #     if self.colsample_bytree < 1.0:
+    #         k = max(1, int(self.colsample_bytree * self.num_features))
+    #     else:
+    #         self.feat_indices_tree = self.feature_indices
+    #         k = self.num_features
+            
+    #     self.per_era_gain = torch.zeros(self.num_eras, k, self.num_bins-1, device=self.device, dtype=torch.float32)
+    #     self.per_era_direction = torch.zeros(self.num_eras, k, self.num_bins-1, device=self.device, dtype=torch.float32)
+
+    #     # Warm start: start from where we left off
+    #     start_iter = self._trees_trained if self.warm_start and self._is_fitted else 0
+        
+    #     # Ensure forest has enough slots
+    #     if len(self.forest) < self.n_estimators:
+    #         self.forest.extend([{} for _ in range(self.n_estimators - len(self.forest))])
+
+    #     for i in range(start_iter, self.n_estimators):
+    #         self.residual = self.Y_gpu - self.gradients
+
+    #         if self.colsample_bytree < 1.0:
+    #             self.feat_indices_tree = torch.randperm(self.num_features, device=self.device, dtype=torch.int32)[:k]
+
+    #         self.root_gradient_histogram, self.root_hessian_histogram = self.compute_histograms( self.root_node_indices, self.feat_indices_tree )
+
+    #         tree = self.grow_tree(
+    #             self.root_gradient_histogram,
+    #             self.root_hessian_histogram,
+    #             self.root_node_indices,
+    #             0,
+    #         )
+    #         self.forest[i] = tree
+    #         self._trees_trained = i + 1
+
+    #         self.compute_eval(i)
+
+    #         if self.stop:
+    #             break
+
+    #     # Aggregate feature importance across eras
+    #     self.feature_importance_ = self.per_era_feature_importance_.sum(axis=0)
+    #     self._is_fitted = True
+        
+    #     print(f"Finished training forest. Total trees: {self._trees_trained}")
 
     def grow_forest_multiclass(self):
         """Multiclass forest growing - K trees per iteration"""
@@ -969,7 +1081,8 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         else:
             # Regression: return values
             bin_indices = self.bin_inference_data(X_np)
-            preds = self.predict_binned(bin_indices).cpu().numpy()
+            #preds = self.predict_binned(bin_indices).cpu().numpy()
+            preds = self.predict_fibonacci(bin_indices).cpu().numpy()
             del bin_indices
             return preds
     
@@ -1250,3 +1363,34 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                 flat[i, 4] = 0.0
 
         return flat
+    
+    
+    def predict_fibonacci(self, bin_indices):
+        """
+        Prediction with Fibonacci Flow.
+        """
+        num_samples = bin_indices.size(0)
+        phi = (1 + 5**0.5) / 2
+        alpha1 = phi / (1 + phi)  # ~0.618
+        alpha2 = 1 / (1 + phi)    # ~0.382
+        
+        f_m2 = torch.full((num_samples,), self.base_prediction, device=self.device)
+        f_m1 = f_m2.clone()
+        
+        for i in range(self._trees_trained):
+            tree = self.forest[i]
+            if not tree: continue
+            
+            h_i = self._compute_tree_predictions(tree, bin_indices)
+            
+            if i == 0:
+                f_current = f_m1 + h_i
+            else:
+                combined_state = alpha1 * f_m1 + alpha2 * f_m2
+                f_current = combined_state + h_i
+            
+            f_m2 = f_m1
+            f_m1 = f_current
+            
+        return f_current
+    

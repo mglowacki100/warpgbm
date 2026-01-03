@@ -689,10 +689,11 @@ class WarpGBM(BaseEstimator, RegressorMixin):
 
             del eval_preds, eval_loss, train_loss
     
-    def grow_forest(self):
+    def grow_forest(self, fibo_weight=0.3):
         """
-        Kompletna implementacja Fibonacci Momentum Grow Forest dla WarpGBM.
-        Zgodna z teorią rekurencyjnych ansambli drugiego rzędu (Fokoué, 2025).
+        Fibonacci-Adaptive Blend Grow Forest.
+        Łączy agresywność WarpGBM ze stabilnością trajektorii Fibonacciego.
+        fibo_weight: 0.0 = czysty WarpGBM, 1.0 = pełny Fibonacci Flow.
         """
         # 1. Inicjalizacja struktur przy pierwszym uruchomieniu
         if not hasattr(self, 'training_loss') or not self.warm_start or not self._is_fitted:
@@ -702,60 +703,61 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             self.feat_indices_tree = self.feature_indices
             self._is_fitted = False
 
-        # 2. Przygotowanie infrastruktury WarpGBM (per_era_gain)
-        # Musimy to robić w każdym wywołaniu, bo k może się zmienić przy colsample_bytree
+        # 2. Przygotowanie infrastruktury pod obliczenia per-era
         k = max(1, int(self.colsample_bytree * self.num_features)) if self.colsample_bytree < 1.0 else self.num_features
         self.per_era_gain = torch.zeros(self.num_eras, k, self.num_bins-1, device=self.device, dtype=torch.float32)
         self.per_era_direction = torch.zeros(self.num_eras, k, self.num_bins-1, device=self.device, dtype=torch.float32)
 
-        # 3. Parametry Fibonacciego (Złoty Podział)
+        # 3. Parametry Fibonacciego
         phi = (1 + 5**0.5) / 2
         alpha1 = phi / (1 + phi)  # ~0.618
         alpha2 = 1 / (1 + phi)    # ~0.382
 
-        # Inicjalizacja bufora pamięci m2 (stan sprzed dwóch kroków)
+        # Bufor pamięci m2 (F_{m-2})
         if not hasattr(self, '_gradients_m2') or not self.warm_start:
-             # Jeśli to start, inicjalizujemy bieżącymi predykcjami (zazwyczaj base_pred)
-             self._gradients_m2 = self.gradients.clone() 
+            self._gradients_m2 = self.gradients.clone()
 
-        # 4. Obsługa Continuous Learning - rozszerzanie listy drzew
         start_iter = self._trees_trained if self.warm_start and self._is_fitted else 0
+        
+        # Zapewnienie miejsca w liście (zapobieganie IndexError)
         if len(self.forest) < self.n_estimators:
             diff = self.n_estimators - len(self.forest)
-            self.forest.extend([None] * diff) # Zapobiega IndexError
+            self.forest.extend([None] * diff)
 
         self.stop = False
         
-        # 5. Główna pętla treningowa
+        # 4. Główna pętla treningowa
         for i in range(start_iter, self.n_estimators):
             
-            # --- FIBONACCI MOMENTUM STEP ---
-            # Wyznaczamy punkt bazowy (Golden Reference)
+            # --- HYBRID REFERENCE POINT ---
             if i > 1:
-                # F_ref = alpha1 * F_{m-1} + alpha2 * F_{m-2}
-                golden_ref = alpha1 * self.gradients + alpha2 * self._gradients_m2
+                # Obliczamy czysty komponent Fibonacciego
+                fibo_ref = alpha1 * self.gradients + alpha2 * self._gradients_m2
+                
+                # Blendowanie: kompromis między stanem aktualnym a "złotą" trajektorią
+                golden_ref = (1 - fibo_weight) * self.gradients + fibo_weight * fibo_ref
             else:
                 golden_ref = self.gradients
 
-            # Obliczamy residua względem wygładzonej trajektorii
+            # Residua wyznaczane względem hybrydowego punktu odniesienia
             self.residual = self.Y_gpu - golden_ref
             
-            # Zapamiętujemy bieżący stan m1 (zostanie m2 w następnej iteracji)
+            # Zapamiętujemy bieżący stan (m1) przed aktualizacją, by stał się m2
+            # Używamy copy_, aby uniknąć zbędnej alokacji pamięci na GPU (P100 optimization)
             old_m1 = self.gradients.clone()
-            # -------------------------------
+            # ------------------------------
 
-            # Losowanie cech (colsample_bytree)
+            # Wybór cech (column sampling)
             if self.colsample_bytree < 1.0:
                 self.feat_indices_tree = torch.randperm(self.num_features, device=self.device, dtype=torch.int32)[:k]
             else:
                 self.feat_indices_tree = self.feature_indices
 
-            # Obliczanie histogramów (rdzeń WarpGBM)
+            # Budowa histogramów i drzewa
             self.root_gradient_histogram, self.root_hessian_histogram = self.compute_histograms(
                 self.root_node_indices, self.feat_indices_tree
             )
 
-            # Budowa drzewa
             tree = self.grow_tree(
                 self.root_gradient_histogram,
                 self.root_hessian_histogram,
@@ -763,22 +765,115 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                 0,
             )
 
-            # Przesunięcie okna pamięci Fibonacciego
-            self._gradients_m2 = old_m1 
+            # Aktualizacja pamięci m2
+            self._gradients_m2.copy_(old_m1)
             
-            # Zapisanie drzewa i metryk
             self.forest[i] = tree
             self._trees_trained = i + 1
-            self.compute_eval(i)
+            
+            # Ewaluacja (np. liczenie CORR na zbiorze walidacyjnym co N kroków)
+            if i % 100 == 0 or i == self.n_estimators - 1:
+                self.compute_eval(i)
 
             if self.stop:
                 break
 
-        # Finalizacja stanu modelu
         self.feature_importance_ = self.per_era_feature_importance_.sum(axis=0)
         self._is_fitted = True
         
-        print(f"Finished training Fibonacci forest. Total trees: {self._trees_trained}")
+        print(f"Finished training Hybrid Fibonacci forest (weight={fibo_weight}). Total trees: {self._trees_trained}")
+    
+    
+    # def grow_forest(self):
+    #     """
+    #     Kompletna implementacja Fibonacci Momentum Grow Forest dla WarpGBM.
+    #     Zgodna z teorią rekurencyjnych ansambli drugiego rzędu (Fokoué, 2025).
+    #     """
+    #     # 1. Inicjalizacja struktur przy pierwszym uruchomieniu
+    #     if not hasattr(self, 'training_loss') or not self.warm_start or not self._is_fitted:
+    #         self.training_loss = []
+    #         self.eval_loss = []
+    #         self.per_era_feature_importance_ = np.zeros((self.num_eras, self.num_features), dtype=np.float32)
+    #         self.feat_indices_tree = self.feature_indices
+    #         self._is_fitted = False
+
+    #     # 2. Przygotowanie infrastruktury WarpGBM (per_era_gain)
+    #     # Musimy to robić w każdym wywołaniu, bo k może się zmienić przy colsample_bytree
+    #     k = max(1, int(self.colsample_bytree * self.num_features)) if self.colsample_bytree < 1.0 else self.num_features
+    #     self.per_era_gain = torch.zeros(self.num_eras, k, self.num_bins-1, device=self.device, dtype=torch.float32)
+    #     self.per_era_direction = torch.zeros(self.num_eras, k, self.num_bins-1, device=self.device, dtype=torch.float32)
+
+    #     # 3. Parametry Fibonacciego (Złoty Podział)
+    #     phi = (1 + 5**0.5) / 2
+    #     alpha1 = phi / (1 + phi)  # ~0.618
+    #     alpha2 = 1 / (1 + phi)    # ~0.382
+
+    #     # Inicjalizacja bufora pamięci m2 (stan sprzed dwóch kroków)
+    #     if not hasattr(self, '_gradients_m2') or not self.warm_start:
+    #          # Jeśli to start, inicjalizujemy bieżącymi predykcjami (zazwyczaj base_pred)
+    #          self._gradients_m2 = self.gradients.clone() 
+
+    #     # 4. Obsługa Continuous Learning - rozszerzanie listy drzew
+    #     start_iter = self._trees_trained if self.warm_start and self._is_fitted else 0
+    #     if len(self.forest) < self.n_estimators:
+    #         diff = self.n_estimators - len(self.forest)
+    #         self.forest.extend([None] * diff) # Zapobiega IndexError
+
+    #     self.stop = False
+        
+    #     # 5. Główna pętla treningowa
+    #     for i in range(start_iter, self.n_estimators):
+            
+    #         # --- FIBONACCI MOMENTUM STEP ---
+    #         # Wyznaczamy punkt bazowy (Golden Reference)
+    #         if i > 1:
+    #             # F_ref = alpha1 * F_{m-1} + alpha2 * F_{m-2}
+    #             golden_ref = alpha1 * self.gradients + alpha2 * self._gradients_m2
+    #         else:
+    #             golden_ref = self.gradients
+
+    #         # Obliczamy residua względem wygładzonej trajektorii
+    #         self.residual = self.Y_gpu - golden_ref
+            
+    #         # Zapamiętujemy bieżący stan m1 (zostanie m2 w następnej iteracji)
+    #         old_m1 = self.gradients.clone()
+    #         # -------------------------------
+
+    #         # Losowanie cech (colsample_bytree)
+    #         if self.colsample_bytree < 1.0:
+    #             self.feat_indices_tree = torch.randperm(self.num_features, device=self.device, dtype=torch.int32)[:k]
+    #         else:
+    #             self.feat_indices_tree = self.feature_indices
+
+    #         # Obliczanie histogramów (rdzeń WarpGBM)
+    #         self.root_gradient_histogram, self.root_hessian_histogram = self.compute_histograms(
+    #             self.root_node_indices, self.feat_indices_tree
+    #         )
+
+    #         # Budowa drzewa
+    #         tree = self.grow_tree(
+    #             self.root_gradient_histogram,
+    #             self.root_hessian_histogram,
+    #             self.root_node_indices,
+    #             0,
+    #         )
+
+    #         # Przesunięcie okna pamięci Fibonacciego
+    #         self._gradients_m2 = old_m1 
+            
+    #         # Zapisanie drzewa i metryk
+    #         self.forest[i] = tree
+    #         self._trees_trained = i + 1
+    #         self.compute_eval(i)
+
+    #         if self.stop:
+    #             break
+
+    #     # Finalizacja stanu modelu
+    #     self.feature_importance_ = self.per_era_feature_importance_.sum(axis=0)
+    #     self._is_fitted = True
+        
+    #     print(f"Finished training Fibonacci forest. Total trees: {self._trees_trained}")
     
     # def grow_forest(self):
     #     """Zoptymalizowany Fibonacci Momentum z kompletną inicjalizacją"""

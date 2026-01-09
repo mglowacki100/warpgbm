@@ -28,6 +28,10 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         colsample_bytree=1.0,
         random_state=None,
         warm_start=False,
+        auto_stop: bool = False,
+        auto_stop_patience: int = 10,
+        auto_stop_threshold: float = 0.01,
+        **kwargs,
     ):
         # Validate arguments
         self._validate_hyperparams(
@@ -79,6 +83,10 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         self.per_era_feature_importance_ = None
         self._is_fitted = False
         self._trees_trained = 0  # Track number of trees already trained
+        self.auto_stop = auto_stop
+        self.auto_stop_patience = auto_stop_patience
+        self.auto_stop_threshold = auto_stop_threshold
+        self.snr_history = []
 
     def _validate_hyperparams(self, **kwargs):
         # Validate objective
@@ -289,6 +297,113 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                 )
 
         return early_stopping_rounds  # May have been defaulted here
+    
+    # --- NOWA METODA: LOGIKA ARTYKUŁU 1703.09580 ---
+    def _check_auto_stop(self, residuals):
+        """
+        Implementacja kryterium zatrzymania opartego na dowodzie statystycznym (Evidence).
+        Analizuje stosunek kwadratu średniego gradientu do jego wariancji.
+        """
+        with torch.no_grad():
+            # W GBDT gradienty to rezydua (lub ujemne gradienty)
+            # Artykuł sugeruje, że gdy szum (wariancja) dominuje nad sygnałem (średnią), 
+            # należy przerwać uczenie.
+            mu_g = torch.mean(residuals)
+            var_g = torch.var(residuals)
+            
+            # Statystyka SNR (Signal-to-Noise Ratio)
+            snr = (mu_g**2) / (var_g + 1e-8)
+            self.snr_history.append(snr.item())
+
+            if len(self.snr_history) > self.auto_stop_patience:
+                # Sprawdzamy średnią z ostatnich kroków (patience)
+                recent_avg_snr = np.mean(self.snr_history[-self.auto_stop_patience:])
+                if recent_avg_snr < self.auto_stop_threshold:
+                    return True
+        return False
+
+    def grow_forest(self):
+        """Regression forest growing"""
+        if not hasattr(self, 'training_loss') or not self.warm_start or not self._is_fitted:
+            self.training_loss = []
+            self.eval_loss = []
+            self.per_era_feature_importance_ = np.zeros((self.num_eras, self.num_features), dtype=np.float32)
+            self.snr_history = [] # Reset SNR
+        
+        self.stop = False
+        k = max(1, int(self.colsample_bytree * self.num_features)) if self.colsample_bytree < 1.0 else self.num_features
+        self.feat_indices_tree = self.feature_indices if self.colsample_bytree >= 1.0 else None
+
+        self.per_era_gain = torch.zeros(self.num_eras, k, self.num_bins-1, device=self.device, dtype=torch.float32)
+        self.per_era_direction = torch.zeros(self.num_eras, k, self.num_bins-1, device=self.device, dtype=torch.float32)
+
+        start_iter = self._trees_trained if self.warm_start and self._is_fitted else 0
+        
+        for i in range(start_iter, self.n_estimators):
+            self.residual = self.Y_gpu - self.gradients
+
+            # --- SPRAWDZENIE AUTO-STOP ---
+            if self.auto_stop and self._check_auto_stop(self.residual):
+                print(f"🛑 [Auto-Stop] Halted at tree {i}. Noise exceeds signal threshold.")
+                break
+
+            if self.colsample_bytree < 1.0:
+                self.feat_indices_tree = torch.randperm(self.num_features, device=self.device, dtype=torch.int32)[:k]
+
+            self.root_gradient_histogram, self.root_hessian_histogram = self.compute_histograms(self.root_node_indices, self.feat_indices_tree)
+
+            tree = self.grow_tree(self.root_gradient_histogram, self.root_hessian_histogram, self.root_node_indices, 0)
+            self.forest[i] = tree
+            self._trees_trained = i + 1
+
+            self.compute_eval(i)
+            if self.stop: break
+
+        self.feature_importance_ = self.per_era_feature_importance_.sum(axis=0)
+        self._is_fitted = True
+
+    def grow_forest_multiclass(self):
+        """Multiclass forest growing"""
+        if not hasattr(self, 'training_loss') or not self.warm_start or not self._is_fitted:
+            self.training_loss = []
+            self.eval_loss = []
+            self.per_era_feature_importance_ = np.zeros((self.num_eras, self.num_features), dtype=np.float32)
+            self.forest = []
+            self.snr_history = [] # Reset SNR
+        
+        self.stop = False
+        k = max(1, int(self.colsample_bytree * self.num_features)) if self.colsample_bytree < 1.0 else self.num_features
+        start_iter = self._trees_trained if self.warm_start and self._is_fitted else 0
+
+        for i in range(start_iter, self.n_estimators):
+            grads, hess = self._compute_softmax_gradients_hessians(self.Y_gpu)
+            
+            # --- SPRAWDZENIE AUTO-STOP (na podstawie uśrednionego gradientu wszystkich klas) ---
+            if self.auto_stop and self._check_auto_stop(grads):
+                print(f"🛑 [Auto-Stop] Halted at round {i}. Noise exceeds signal threshold.")
+                break
+
+            trees_k = []
+            if self.colsample_bytree < 1.0:
+                self.feat_indices_tree = torch.randperm(self.num_features, device=self.device, dtype=torch.int32)[:k]
+            else:
+                self.feat_indices_tree = self.feature_indices
+            
+            for class_k in range(self.num_classes):
+                self.residual = -grads[:, class_k]
+                self.root_gradient_histogram, self.root_hessian_histogram = self.compute_histograms_multiclass(
+                    self.root_node_indices, self.feat_indices_tree, self.residual, hess[:, class_k]
+                )
+                tree_k = self.grow_tree(self.root_gradient_histogram, self.root_hessian_histogram, self.root_node_indices, 0, class_k=class_k)
+                trees_k.append(tree_k)
+            
+            self.forest.append(trees_k)
+            self._trees_trained = i + 1
+            self.compute_eval_multiclass(i)
+            if self.stop: break
+
+        self.feature_importance_ = self.per_era_feature_importance_.sum(axis=0)
+        self._is_fitted = True
 
     def fit(
         self,
@@ -689,133 +804,133 @@ class WarpGBM(BaseEstimator, RegressorMixin):
 
             del eval_preds, eval_loss, train_loss
 
-    def grow_forest(self):
-        """Regression forest growing (original logic)"""
-        # Warm start: preserve existing training state
-        if not hasattr(self, 'training_loss') or not self.warm_start or not self._is_fitted:
-            self.training_loss = []
-            self.eval_loss = []  # if eval set is given
-            self.per_era_feature_importance_ = np.zeros((self.num_eras, self.num_features), dtype=np.float32)
+    # def grow_forest(self):
+    #     """Regression forest growing (original logic)"""
+    #     # Warm start: preserve existing training state
+    #     if not hasattr(self, 'training_loss') or not self.warm_start or not self._is_fitted:
+    #         self.training_loss = []
+    #         self.eval_loss = []  # if eval set is given
+    #         self.per_era_feature_importance_ = np.zeros((self.num_eras, self.num_features), dtype=np.float32)
         
-        self.stop = False
+    #     self.stop = False
 
-        if self.colsample_bytree < 1.0:
-            k = max(1, int(self.colsample_bytree * self.num_features))
-        else:
-            self.feat_indices_tree = self.feature_indices
-            k = self.num_features
+    #     if self.colsample_bytree < 1.0:
+    #         k = max(1, int(self.colsample_bytree * self.num_features))
+    #     else:
+    #         self.feat_indices_tree = self.feature_indices
+    #         k = self.num_features
             
-        self.per_era_gain = torch.zeros(self.num_eras, k, self.num_bins-1, device=self.device, dtype=torch.float32)
-        self.per_era_direction = torch.zeros(self.num_eras, k, self.num_bins-1, device=self.device, dtype=torch.float32)
+    #     self.per_era_gain = torch.zeros(self.num_eras, k, self.num_bins-1, device=self.device, dtype=torch.float32)
+    #     self.per_era_direction = torch.zeros(self.num_eras, k, self.num_bins-1, device=self.device, dtype=torch.float32)
 
-        # Warm start: start from where we left off
-        start_iter = self._trees_trained if self.warm_start and self._is_fitted else 0
+    #     # Warm start: start from where we left off
+    #     start_iter = self._trees_trained if self.warm_start and self._is_fitted else 0
         
-        # Ensure forest has enough slots
-        if len(self.forest) < self.n_estimators:
-            self.forest.extend([{} for _ in range(self.n_estimators - len(self.forest))])
+    #     # Ensure forest has enough slots
+    #     if len(self.forest) < self.n_estimators:
+    #         self.forest.extend([{} for _ in range(self.n_estimators - len(self.forest))])
 
-        for i in range(start_iter, self.n_estimators):
-            self.residual = self.Y_gpu - self.gradients
+    #     for i in range(start_iter, self.n_estimators):
+    #         self.residual = self.Y_gpu - self.gradients
 
-            if self.colsample_bytree < 1.0:
-                self.feat_indices_tree = torch.randperm(self.num_features, device=self.device, dtype=torch.int32)[:k]
+    #         if self.colsample_bytree < 1.0:
+    #             self.feat_indices_tree = torch.randperm(self.num_features, device=self.device, dtype=torch.int32)[:k]
 
-            self.root_gradient_histogram, self.root_hessian_histogram = self.compute_histograms( self.root_node_indices, self.feat_indices_tree )
+    #         self.root_gradient_histogram, self.root_hessian_histogram = self.compute_histograms( self.root_node_indices, self.feat_indices_tree )
 
-            tree = self.grow_tree(
-                self.root_gradient_histogram,
-                self.root_hessian_histogram,
-                self.root_node_indices,
-                0,
-            )
-            self.forest[i] = tree
-            self._trees_trained = i + 1
+    #         tree = self.grow_tree(
+    #             self.root_gradient_histogram,
+    #             self.root_hessian_histogram,
+    #             self.root_node_indices,
+    #             0,
+    #         )
+    #         self.forest[i] = tree
+    #         self._trees_trained = i + 1
 
-            self.compute_eval(i)
+    #         self.compute_eval(i)
 
-            if self.stop:
-                break
+    #         if self.stop:
+    #             break
 
-        # Aggregate feature importance across eras
-        self.feature_importance_ = self.per_era_feature_importance_.sum(axis=0)
-        self._is_fitted = True
+    #     # Aggregate feature importance across eras
+    #     self.feature_importance_ = self.per_era_feature_importance_.sum(axis=0)
+    #     self._is_fitted = True
         
-        print(f"Finished training forest. Total trees: {self._trees_trained}")
+    #     print(f"Finished training forest. Total trees: {self._trees_trained}")
 
-    def grow_forest_multiclass(self):
-        """Multiclass forest growing - K trees per iteration"""
-        # Warm start: preserve existing training state
-        if not hasattr(self, 'training_loss') or not self.warm_start or not self._is_fitted:
-            self.training_loss = []
-            self.eval_loss = []
-            self.per_era_feature_importance_ = np.zeros((self.num_eras, self.num_features), dtype=np.float32)
-            # Store K trees per iteration
-            self.forest = []
+    # def grow_forest_multiclass(self):
+    #     """Multiclass forest growing - K trees per iteration"""
+    #     # Warm start: preserve existing training state
+    #     if not hasattr(self, 'training_loss') or not self.warm_start or not self._is_fitted:
+    #         self.training_loss = []
+    #         self.eval_loss = []
+    #         self.per_era_feature_importance_ = np.zeros((self.num_eras, self.num_features), dtype=np.float32)
+    #         # Store K trees per iteration
+    #         self.forest = []
         
-        self.stop = False
+    #     self.stop = False
 
-        if self.colsample_bytree < 1.0:
-            k = max(1, int(self.colsample_bytree * self.num_features))
-        else:
-            self.feat_indices_tree = self.feature_indices
-            k = self.num_features
+    #     if self.colsample_bytree < 1.0:
+    #         k = max(1, int(self.colsample_bytree * self.num_features))
+    #     else:
+    #         self.feat_indices_tree = self.feature_indices
+    #         k = self.num_features
             
-        self.per_era_gain = torch.zeros(self.num_eras, k, self.num_bins-1, device=self.device, dtype=torch.float32)
-        self.per_era_direction = torch.zeros(self.num_eras, k, self.num_bins-1, device=self.device, dtype=torch.float32)
+    #     self.per_era_gain = torch.zeros(self.num_eras, k, self.num_bins-1, device=self.device, dtype=torch.float32)
+    #     self.per_era_direction = torch.zeros(self.num_eras, k, self.num_bins-1, device=self.device, dtype=torch.float32)
 
-        # Warm start: start from where we left off
-        start_iter = self._trees_trained if self.warm_start and self._is_fitted else 0
+    #     # Warm start: start from where we left off
+    #     start_iter = self._trees_trained if self.warm_start and self._is_fitted else 0
 
-        for i in range(start_iter, self.n_estimators):
-            # Compute softmax probabilities and gradients/hessians for all classes
-            grads, hess = self._compute_softmax_gradients_hessians(self.Y_gpu)
+    #     for i in range(start_iter, self.n_estimators):
+    #         # Compute softmax probabilities and gradients/hessians for all classes
+    #         grads, hess = self._compute_softmax_gradients_hessians(self.Y_gpu)
             
-            # Train K trees (one per class)
-            trees_k = []
+    #         # Train K trees (one per class)
+    #         trees_k = []
             
-            if self.colsample_bytree < 1.0:
-                self.feat_indices_tree = torch.randperm(self.num_features, device=self.device, dtype=torch.int32)[:k]
+    #         if self.colsample_bytree < 1.0:
+    #             self.feat_indices_tree = torch.randperm(self.num_features, device=self.device, dtype=torch.int32)[:k]
             
-            for class_k in range(self.num_classes):
-                # Set residual for this class (negative gradient)
-                self.residual = -grads[:, class_k]
+    #         for class_k in range(self.num_classes):
+    #             # Set residual for this class (negative gradient)
+    #             self.residual = -grads[:, class_k]
                 
-                # Compute histograms for this class
-                # For multiclass, we treat hessian as "weights" - use them directly
-                # We'll compute histograms by accumulating grad and hess
-                self.root_gradient_histogram, self.root_hessian_histogram = (
-                    self.compute_histograms_multiclass(
-                        self.root_node_indices, 
-                        self.feat_indices_tree, 
-                        self.residual,
-                        hess[:, class_k]
-                    )
-                )
+    #             # Compute histograms for this class
+    #             # For multiclass, we treat hessian as "weights" - use them directly
+    #             # We'll compute histograms by accumulating grad and hess
+    #             self.root_gradient_histogram, self.root_hessian_histogram = (
+    #                 self.compute_histograms_multiclass(
+    #                     self.root_node_indices, 
+    #                     self.feat_indices_tree, 
+    #                     self.residual,
+    #                     hess[:, class_k]
+    #                 )
+    #             )
                 
-                # Grow tree for this class (pass class_k to update correct column)
-                tree_k = self.grow_tree(
-                    self.root_gradient_histogram,
-                    self.root_hessian_histogram,
-                    self.root_node_indices,
-                    0,
-                    class_k=class_k,
-                )
-                trees_k.append(tree_k)
+    #             # Grow tree for this class (pass class_k to update correct column)
+    #             tree_k = self.grow_tree(
+    #                 self.root_gradient_histogram,
+    #                 self.root_hessian_histogram,
+    #                 self.root_node_indices,
+    #                 0,
+    #                 class_k=class_k,
+    #             )
+    #             trees_k.append(tree_k)
             
-            self.forest.append(trees_k)
-            self._trees_trained = i + 1
+    #         self.forest.append(trees_k)
+    #         self._trees_trained = i + 1
             
-            self.compute_eval_multiclass(i)
+    #         self.compute_eval_multiclass(i)
 
-            if self.stop:
-                break
+    #         if self.stop:
+    #             break
 
-        # Aggregate feature importance across eras
-        self.feature_importance_ = self.per_era_feature_importance_.sum(axis=0)
-        self._is_fitted = True
+    #     # Aggregate feature importance across eras
+    #     self.feature_importance_ = self.per_era_feature_importance_.sum(axis=0)
+    #     self._is_fitted = True
         
-        print(f"Finished training multiclass forest. Total rounds: {self._trees_trained} ({self._trees_trained * self.num_classes} trees)")
+    #     print(f"Finished training multiclass forest. Total rounds: {self._trees_trained} ({self._trees_trained * self.num_classes} trees)")
     
     def compute_eval_multiclass(self, i):
         """Evaluation for multiclass"""

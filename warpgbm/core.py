@@ -26,6 +26,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         L2_reg=1e-6,
         device="cuda",
         colsample_bytree=1.0,
+        col_sample_by_group=None,
         random_state=None,
         warm_start=False,
     ):
@@ -72,6 +73,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         self.L2_reg = L2_reg
         self.forest = [{} for _ in range(self.n_estimators)]
         self.colsample_bytree = colsample_bytree
+        self.col_sample_by_group = col_sample_by_group
         self.random_state = random_state
         self.warm_start = warm_start
         self.label_encoder = None
@@ -141,6 +143,46 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             raise ValueError(
                 f"Invalid colsample_bytree: {kwargs['colsample_bytree']}. Must be a float value > 0 and <= 1."
             )
+            
+        if kwargs["colsample_bytree"] < 1 and kwargs["col_sample_by_group"] is not None:
+            raise ValueError(
+                f"Invalid colsample_bytree and col_sample_by_group don't work together in this version"
+            )    
+            
+            
+    def _get_sampled_features(self):
+        if self.col_sample_by_group is not None:
+            all_sampled_indices = []
+            current_offset = 0
+            
+            for group_size, sample_rate in self.col_sample_by_group.items():
+                # Safety check
+                actual_group_size = min(group_size, self.num_features - current_offset)
+                if actual_group_size <= 0:
+                    break
+                    
+                
+                group_indices = torch.arange(current_offset, current_offset + actual_group_size, 
+                                             device=self.device, dtype=torch.int32)
+                
+                
+                k = max(1, int(sample_rate * actual_group_size))
+                
+                # Random draw inside group (permutation and cut)
+                perm = torch.randperm(actual_group_size, device=self.device)
+                sampled_from_group = group_indices[perm[:k]]
+                
+                all_sampled_indices.append(sampled_from_group)
+                current_offset += actual_group_size
+                
+            return torch.cat(all_sampled_indices)
+        
+        # Fallback to colsample_bytree
+        if self.colsample_bytree < 1.0:
+            k = max(1, int(self.colsample_bytree * self.num_features))
+            return torch.randperm(self.num_features, device=self.device, dtype=torch.int32)[:k]
+    
+        return self.feature_indices
 
     def _compute_tree_predictions(self, tree, bin_indices):
         """
@@ -699,11 +741,15 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         
         self.stop = False
 
-        if self.colsample_bytree < 1.0:
-            k = max(1, int(self.colsample_bytree * self.num_features))
-        else:
-            self.feat_indices_tree = self.feature_indices
-            k = self.num_features
+        # if self.colsample_bytree < 1.0:
+        #     k = max(1, int(self.colsample_bytree * self.num_features))
+        # else:
+        #     self.feat_indices_tree = self.feature_indices
+        #     k = self.num_features
+            
+        self.feat_indices_tree = self._get_sampled_features()
+        k = len(self.feat_indices_tree)
+        
             
         self.per_era_gain = torch.zeros(self.num_eras, k, self.num_bins-1, device=self.device, dtype=torch.float32)
         self.per_era_direction = torch.zeros(self.num_eras, k, self.num_bins-1, device=self.device, dtype=torch.float32)

@@ -763,10 +763,12 @@ class WarpGBM(BaseEstimator, RegressorMixin):
 
         for i in range(start_iter, self.n_estimators):
             self.residual = self.Y_gpu - self.gradients
+            
+            self.feat_indices_tree = self._get_sampled_features()
 
-            if self.colsample_bytree < 1.0:
-                self.feat_indices_tree = torch.randperm(self.num_features, device=self.device, dtype=torch.int32)[:k]
-
+            # if self.colsample_bytree < 1.0:
+            #     self.feat_indices_tree = torch.randperm(self.num_features, device=self.device, dtype=torch.int32)[:k]
+                
             self.root_gradient_histogram, self.root_hessian_histogram = self.compute_histograms( self.root_node_indices, self.feat_indices_tree )
 
             tree = self.grow_tree(

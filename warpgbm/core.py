@@ -144,10 +144,10 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                 f"Invalid colsample_bytree: {kwargs['colsample_bytree']}. Must be a float value > 0 and <= 1."
             )
             
-        if kwargs["colsample_bytree"] < 1 and kwargs["col_sample_by_group"] is not None:
-            raise ValueError(
-                f"Invalid colsample_bytree and col_sample_by_group don't work together in this version"
-            )    
+        # if kwargs["colsample_bytree"] < 1 and kwargs["col_sample_by_group"] is not None:
+        #     raise ValueError(
+        #         f"Invalid colsample_bytree and col_sample_by_group don't work together in this version"
+        #     )    
             
             
     def _get_sampled_features(self):

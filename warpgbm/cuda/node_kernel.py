@@ -3,7 +3,6 @@ import triton
 import triton.language as tl
 
 
-
 @triton.jit
 def _bin_column_kernel(
     x_ptr, bin_edges_ptr, bin_indices_ptr,
@@ -15,15 +14,14 @@ def _bin_column_kernel(
     mask = offsets < N
 
     val = tl.load(x_ptr + offsets, mask=mask)
-    # Inicjalizacja jako int8
+    # Inicjalizacja binów jako int8
     bin_idx = tl.zeros([BLOCK_SIZE], dtype=tl.int8)
 
-    # Liniowy skan progów
     for b in range(B_minus1):
         edge = tl.load(bin_edges_ptr + b)
-        # KLUCZOWA POPRAWKA: rzutujemy wynik (b + 1) na int8
-        new_bin_val = (b + 1).to(tl.int8)
-        bin_idx = tl.where(val >= edge, new_bin_val, bin_idx)
+        # Rzutujemy b+1 na int8 przed użyciem w tl.where
+        new_val = (b + 1).to(tl.int8) 
+        bin_idx = tl.where(val >= edge, new_val, bin_idx)
     
     tl.store(bin_indices_ptr + offsets, bin_idx, mask=mask)
 

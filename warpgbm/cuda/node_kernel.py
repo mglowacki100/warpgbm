@@ -88,7 +88,8 @@ def _histogram_kernel(
         tl.store(shared_grad + idx, 0.0, mask=mask_init)
         tl.store(shared_hess + idx, 0.0, mask=mask_init)
     
-    tl.sync_barrier()  # Ensure all threads have initialized shared mem
+    #tl.sync_barrier()  # Ensure all threads have initialized shared mem
+    tl.debug_barrier()
     
     # Local aggregation: Atomic add to shared memory (faster than global)
     # Offset in shared: era * B + bin
@@ -96,7 +97,8 @@ def _histogram_kernel(
     tl.atomic_add(shared_grad + local_offset, residuals, mask=row_mask)
     tl.atomic_add(shared_hess + local_offset, 1.0, mask=row_mask)
     
-    tl.sync_barrier()  # Sync after all local additions
+    #tl.sync_barrier()  # Sync after all local additions
+    tl.debug_barrier()
     
     # Reduction: Aggregate from shared to global memory
     # Distribute the work: each thread handles a portion of the era-bin space

@@ -131,30 +131,28 @@ def _predict_kernel(
     
     # Maksymalna głębokość pętli (zabezpieczenie przed nieskończonością)
     for _ in range(64):
-        if not tl.reduce(active, "any", axis=0): break
-        
+        if not tl.reduce(active, 0, "any"):
+            break
+    
         # tree_tensor [T, max_nodes, 6]
         tree_node_base = t_idx * max_nodes * 6 + node_id * 6
         
         is_leaf = tl.load(tree_ptr + tree_node_base + 4, mask=active)
         leaf_mask = active & (is_leaf > 0.5)
         
-        if tl.reduce(leaf_mask, "any", axis=0):
+        if tl.reduce(leaf_mask, 0, "any"):
             val = tl.load(tree_ptr + tree_node_base + 5, mask=leaf_mask)
             tl.atomic_add(out_ptr + s_idx, val * lr, mask=leaf_mask)
             active = active & (~leaf_mask)
-
+    
         # Decyzja o skoku
         feat = tl.load(tree_ptr + tree_node_base + 0, mask=active).to(tl.int32)
         split_bin = tl.load(tree_ptr + tree_node_base + 1, mask=active)
         
-        # Pobranie binu z danych
         bin_val = tl.load(bin_ptr + s_idx * F + feat, mask=active)
         
-        # Wewnątrz pętli w _predict_kernel:
         left_id = tl.load(tree_ptr + tree_node_base + 2, mask=active).to(tl.int32)
         right_id = tl.load(tree_ptr + tree_node_base + 3, mask=active).to(tl.int32)
-        # Teraz typ node_id pozostanie spójny (int32)
         node_id = tl.where(bin_val <= split_bin, left_id, right_id)
         
 

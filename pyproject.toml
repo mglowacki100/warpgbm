@@ -1,17 +1,18 @@
 [build-system]
-requires = ["setuptools", "wheel", "torch", "numpy"]
+requires = ["setuptools", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "warpgbm"
 version = "2.2.0"
-description = "A fast GPU-accelerated Gradient Boosted Decision Tree library with PyTorch + CUDA"
+description = "A fast GPU-accelerated GBDT library using PyTorch + Triton"
 readme = "README.md"
 requires-python = ">=3.8"
 license = { file = "LICENSE" }
 dependencies = [
-    "torch",
+    "torch>=2.0.0", # Triton requires PyTorch 2.0+
+    "triton",       # crucial zależność
     "numpy",
     "tqdm",
-    "scikit-learn"              
+    "scikit-learn"
 ]

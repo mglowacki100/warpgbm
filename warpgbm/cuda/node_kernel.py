@@ -14,16 +14,17 @@ def _bin_column_kernel(
     mask = offsets < N
 
     val = tl.load(x_ptr + offsets, mask=mask)
-    # Inicjalizacja binów jako int8
-    bin_idx = tl.zeros([BLOCK_SIZE], dtype=tl.int8)
+
+    bin_idx = tl.zeros([BLOCK_SIZE], dtype=tl.int32)
+
 
     for b in range(B_minus1):
         edge = tl.load(bin_edges_ptr + b)
-        # Rzutujemy b+1 na int8 przed użyciem w tl.where
-        new_val = (b + 1).to(tl.int8) 
-        bin_idx = tl.where(val >= edge, new_val, bin_idx)
+        bin_idx = tl.where(val >= edge, b + 1, bin_idx)
     
-    tl.store(bin_indices_ptr + offsets, bin_idx, mask=mask)
+    #tl.store(bin_indices_ptr + offsets, bin_idx, mask=mask)
+    tl.store(bin_indices_ptr + offsets, bin_idx.to(tl.int8), mask=mask)
+
 
 # --- KERNEL 2: HISTOGRAM ---
 @triton.jit

@@ -111,14 +111,13 @@ def _split_kernel(
         tl.store(dir_ptr + base_out + b, tl.where(valid, direction, 0.0), mask=f_mask)
 
 
-
 @triton.jit
 def _predict_kernel(
     bin_ptr, tree_ptr, out_ptr,
     N, F, T, max_nodes, lr,
     BLOCK_SIZE: tl.constexpr
 ):
-    block_size = BLOCK_SIZE  # <-- konieczne
+    block_size: tl.constexpr = BLOCK_SIZE  # konieczne
     pid = tl.program_id(0)
     idx = pid * block_size + tl.arange(0, block_size)
     
@@ -149,6 +148,7 @@ def _predict_kernel(
         left_id = tl.load(tree_ptr + tree_node_base + 2, mask=active).to(tl.int32)
         right_id = tl.load(tree_ptr + tree_node_base + 3, mask=active).to(tl.int32)
         node_id = tl.where(bin_val <= split_bin, left_id, right_id)
+
 
 
 # --- WRAPPERS ---

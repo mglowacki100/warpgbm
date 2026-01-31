@@ -28,42 +28,95 @@ def _bin_column_kernel(
 
 # --- KERNEL 2: HISTOGRAM ---
 @triton.jit
-def _histogram_kernel(
-    bin_ptr, res_ptr, sample_idx_ptr, feat_idx_ptr, era_idx_ptr,
-    grad_hist_ptr, hess_hist_ptr,
-    N, F_master, F_active, B, num_eras,
+def _histogram_kernel_optimized(
+    bin_ptr,            # Pointer to bin indices [N, F_master]
+    res_ptr,            # Pointer to residuals [N]
+    sample_idx_ptr,     # Pointer to active sample indices [N_active]
+    feat_idx_ptr,       # Pointer to active feature mapping [F_active]
+    era_idx_ptr,        # Pointer to era indices [N]
+    grad_hist_ptr,      # Output: Gradient histogram [num_eras, F_active, B]
+    hess_hist_ptr,      # Output: Hessian histogram [num_eras, F_active, B]
+    N,                  # Total number of active samples
+    F_master,           # Total features in the original dataset
+    F_active,           # Number of features we are currently processing
+    B,                  # Number of bins (e.g., 5)
+    num_eras,           # Number of eras
     BLOCK_SIZE: tl.constexpr
 ):
-    feat_order_idx = tl.program_id(0) # Która cecha z listy wybranych
-    tile_idx = tl.program_id(1)      # Który blok próbek
+    # 1. Thread Mapping
+    # Program ID 0 manages which feature we are processing
+    # Program ID 1 manages the tile/block of samples
+    feat_order_idx = tl.program_id(0) 
+    tile_idx = tl.program_id(1)      
     
-    # Pobierz prawdziwy indeks cechy z mapowania
+    # Load the actual feature index from the mapping table
     feat_idx = tl.load(feat_idx_ptr + feat_order_idx)
     
+    # Calculate sample offsets for this block
     row_offsets = tile_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     row_mask = row_offsets < N
     
-    # Załadowanie indeksów próbek i przypisanie do er oraz binów
-    s_idx = tl.load(sample_idx_ptr + row_offsets, mask=row_mask)
-    era = tl.load(era_idx_ptr + s_idx, mask=row_mask)
-    # Załadowanie binów: bin_indices[sample * F_master + feat]
-    b_val = tl.load(bin_ptr + s_idx * F_master + feat_idx, mask=row_mask)
-    res = tl.load(res_ptr + s_idx, mask=row_mask)
+    # 2. Data Loading (Coalesced Memory Access)
+    # Load indices of samples belonging to the current node/active set
+    s_indices = tl.load(sample_idx_ptr + row_offsets, mask=row_mask)
+    
+    # Load era and bin assignments for these specific samples
+    # bins: find the bin for the specific sample and feature
+    eras = tl.load(era_idx_ptr + s_indices, mask=row_mask)
+    bins = tl.load(bin_ptr + s_indices * F_master + feat_idx, mask=row_mask)
+    residuals = tl.load(res_ptr + s_indices, mask=row_mask)
 
-    # Iteracja po erach i binach wewnątrz bloku
-    # Triton zoptymalizuje to pod kątem dostępu do pamięci
-    for e in range(num_eras):
-        era_mask = row_mask & (era == e)
-        for b in range(B):
-            final_mask = era_mask & (b_val == b)
+    # 3. Destination Address Calculation
+    # The histogram is stored in a 3D layout: [era, feature, bin]
+    # We flatten this to a 1D offset: 
+    # offset = (era * total_features_in_output * bins_per_feat) + (feat_idx * bins_per_feat) + bin
+    output_offset = eras * (F_active * B) + feat_order_idx * B + bins
+    
+    # 4. Atomic Aggregation
+    # Instead of looping through all possible bins and eras, we "scatter" the 
+    # values directly to their destination using hardware-accelerated atomics.
+    # At B=5, the L2 cache efficiently handles collisions.
+    tl.atomic_add(grad_hist_ptr + output_offset, residuals, mask=row_mask)
+    tl.atomic_add(hess_hist_ptr + output_offset, 1.0, mask=row_mask)
+
+
+# @triton.jit
+# def _histogram_kernel(
+#     bin_ptr, res_ptr, sample_idx_ptr, feat_idx_ptr, era_idx_ptr,
+#     grad_hist_ptr, hess_hist_ptr,
+#     N, F_master, F_active, B, num_eras,
+#     BLOCK_SIZE: tl.constexpr
+# ):
+#     feat_order_idx = tl.program_id(0) # Która cecha z listy wybranych
+#     tile_idx = tl.program_id(1)      # Który blok próbek
+    
+#     # Pobierz prawdziwy indeks cechy z mapowania
+#     feat_idx = tl.load(feat_idx_ptr + feat_order_idx)
+    
+#     row_offsets = tile_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+#     row_mask = row_offsets < N
+    
+#     # Załadowanie indeksów próbek i przypisanie do er oraz binów
+#     s_idx = tl.load(sample_idx_ptr + row_offsets, mask=row_mask)
+#     era = tl.load(era_idx_ptr + s_idx, mask=row_mask)
+#     # Załadowanie binów: bin_indices[sample * F_master + feat]
+#     b_val = tl.load(bin_ptr + s_idx * F_master + feat_idx, mask=row_mask)
+#     res = tl.load(res_ptr + s_idx, mask=row_mask)
+
+#     # Iteracja po erach i binach wewnątrz bloku
+#     # Triton zoptymalizuje to pod kątem dostępu do pamięci
+#     for e in range(num_eras):
+#         era_mask = row_mask & (era == e)
+#         for b in range(B):
+#             final_mask = era_mask & (b_val == b)
             
-            g_sum = tl.sum(tl.where(final_mask, res, 0.0), axis=0)
-            h_sum = tl.sum(tl.where(final_mask, 1.0, 0.0), axis=0)
+#             g_sum = tl.sum(tl.where(final_mask, res, 0.0), axis=0)
+#             h_sum = tl.sum(tl.where(final_mask, 1.0, 0.0), axis=0)
             
-            if g_sum != 0 or h_sum != 0:
-                out_off = e * (F_active * B) + feat_order_idx * B + b
-                tl.atomic_add(grad_hist_ptr + out_off, g_sum)
-                tl.atomic_add(hess_hist_ptr + out_off, h_sum)
+#             if g_sum != 0 or h_sum != 0:
+#                 out_off = e * (F_active * B) + feat_order_idx * B + b
+#                 tl.atomic_add(grad_hist_ptr + out_off, g_sum)
+#                 tl.atomic_add(hess_hist_ptr + out_off, h_sum)
 
 # --- KERNEL 3: DIRECTIONAL SPLIT ---
 @triton.jit

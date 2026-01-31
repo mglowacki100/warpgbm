@@ -169,8 +169,10 @@ def _predict_kernel(
     # Przechodzenie po drzewie
     for _ in range(64):
         # Sprawdzenie czy jakiekolwiek włókno w bloku jeszcze pracuje
-        if not tl.any(active, axis=0):
+        if tl.max(active.to(tl.int32), axis=0) == 0:
             break
+        # if not tl.any(active, axis=0):
+        #     break
             
         tree_node_base = t_idx * max_nodes * 6 + node_id * 6
         

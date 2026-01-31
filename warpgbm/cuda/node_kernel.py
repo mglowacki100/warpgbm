@@ -110,33 +110,30 @@ def _split_kernel(
         tl.store(gain_ptr + base_out + b, tl.where(valid, gain, 0.0), mask=f_mask)
         tl.store(dir_ptr + base_out + b, tl.where(valid, direction, 0.0), mask=f_mask)
 
-# --- KERNEL 4: PREDICT FOREST ---
+
+
 @triton.jit
 def _predict_kernel(
     bin_ptr, tree_ptr, out_ptr,
     N, F, T, max_nodes, lr,
     BLOCK_SIZE: tl.constexpr
 ):
+    block_size = BLOCK_SIZE  # <-- konieczne
     pid = tl.program_id(0)
-    idx = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    idx = pid * block_size + tl.arange(0, block_size)
     
-    # Każdy program obsługuje parę (próbka, drzewo)
     mask = idx < (N * T)
     s_idx = idx % N
     t_idx = idx // N
-    
-    # Startujemy od korzenia dla każdej próbki
-    node_id = tl.zeros([BLOCK_SIZE], dtype=tl.int32)
+
+    node_id = tl.zeros([block_size], dtype=tl.int32)
     active = mask
-    
-    # Maksymalna głębokość pętli (zabezpieczenie przed nieskończonością)
+
     for _ in range(64):
         if not tl.reduce(active, 0, "any"):
             break
-    
-        # tree_tensor [T, max_nodes, 6]
+
         tree_node_base = t_idx * max_nodes * 6 + node_id * 6
-        
         is_leaf = tl.load(tree_ptr + tree_node_base + 4, mask=active)
         leaf_mask = active & (is_leaf > 0.5)
         
@@ -144,17 +141,15 @@ def _predict_kernel(
             val = tl.load(tree_ptr + tree_node_base + 5, mask=leaf_mask)
             tl.atomic_add(out_ptr + s_idx, val * lr, mask=leaf_mask)
             active = active & (~leaf_mask)
-    
-        # Decyzja o skoku
+
         feat = tl.load(tree_ptr + tree_node_base + 0, mask=active).to(tl.int32)
         split_bin = tl.load(tree_ptr + tree_node_base + 1, mask=active)
-        
         bin_val = tl.load(bin_ptr + s_idx * F + feat, mask=active)
-        
+
         left_id = tl.load(tree_ptr + tree_node_base + 2, mask=active).to(tl.int32)
         right_id = tl.load(tree_ptr + tree_node_base + 3, mask=active).to(tl.int32)
         node_id = tl.where(bin_val <= split_bin, left_id, right_id)
-        
+
 
 # --- WRAPPERS ---
 

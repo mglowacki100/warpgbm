@@ -114,6 +114,9 @@ def _split_kernel(
 # BLOCK_SIZE is a literal Python int; Triton kernels prefer literals over constexpr for stability
 BLOCK_SIZE = 128
 
+
+
+
 @triton.jit
 def _predict_kernel(
     bin_ptr,        # pointer to binned input data [N, F]
@@ -221,5 +224,5 @@ def predict_forest(bin_indices, tree_tensor, learning_rate, out):
     T, max_nodes, _ = tree_tensor.shape
     grid = lambda meta: (triton.cdiv(N * T, meta['BLOCK_SIZE']),)
     _predict_kernel[grid](
-        bin_indices, tree_tensor, out, N, F, T, max_nodes, learning_rate, BLOCK_SIZE=512
+        bin_indices, tree_tensor, out, N, F, T, max_nodes, learning_rate
     )

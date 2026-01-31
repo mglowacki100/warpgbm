@@ -116,36 +116,87 @@ def _split_kernel(
 
 
 
+# @triton.jit
+# def _predict_kernel(
+#     bin_ptr, tree_ptr, out_ptr,
+#     N, F, T, max_nodes, lr,
+#     BLOCK_SIZE: tl.constexpr  # <- compile-time constant
+# ):
+#     pid = tl.program_id(0)
+#     idx = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+#     mask = idx < (N * T)
+#     s_idx = idx % N
+#     t_idx = idx // N
+#     node_id = tl.zeros([BLOCK_SIZE], dtype=tl.int32)
+#     active = mask
+#     for _ in range(64):
+#         if not tl.reduce(active, 0, "any"):
+#             break
+#         tree_node_base = t_idx * max_nodes * 6 + node_id * 6
+#         is_leaf = tl.load(tree_ptr + tree_node_base + 4, mask=active)
+#         leaf_mask = active & (is_leaf > 0.5)
+#         if tl.reduce(leaf_mask, 0, "any"):
+#             val = tl.load(tree_ptr + tree_node_base + 5, mask=leaf_mask)
+#             tl.atomic_add(out_ptr + s_idx, val * lr, mask=leaf_mask)
+#             active = active & (~leaf_mask)
+#         feat = tl.load(tree_ptr + tree_node_base + 0, mask=active).to(tl.int32)
+#         split_bin = tl.load(tree_ptr + tree_node_base + 1, mask=active)
+#         bin_val = tl.load(bin_ptr + s_idx * F + feat, mask=active)
+#         left_id = tl.load(tree_ptr + tree_node_base + 2, mask=active).to(tl.int32)
+#         right_id = tl.load(tree_ptr + tree_node_base + 3, mask=active).to(tl.int32)
+#         node_id = tl.where(bin_val <= split_bin, left_id, right_id)
+
+
 @triton.jit
 def _predict_kernel(
     bin_ptr, tree_ptr, out_ptr,
     N, F, T, max_nodes, lr,
-    BLOCK_SIZE: tl.constexpr  # <- compile-time constant
+    BLOCK_SIZE: tl.constexpr
 ):
     pid = tl.program_id(0)
     idx = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    
+    # N to liczba próbek, T to liczba drzew
+    # Poprawka maskowania, aby nie wyjść poza zakres
     mask = idx < (N * T)
-    s_idx = idx % N
-    t_idx = idx // N
+    
+    s_idx = idx % N  # Indeks próbki
+    t_idx = idx // N # Indeks drzewa
+    
     node_id = tl.zeros([BLOCK_SIZE], dtype=tl.int32)
     active = mask
+    
+    # Przechodzenie po drzewie
     for _ in range(64):
-        if not tl.reduce(active, 0, "any"):
+        # Sprawdzenie czy jakiekolwiek włókno w bloku jeszcze pracuje
+        if not tl.any(active, axis=0):
             break
+            
         tree_node_base = t_idx * max_nodes * 6 + node_id * 6
-        is_leaf = tl.load(tree_ptr + tree_node_base + 4, mask=active)
+        
+        # Ładujemy informację czy to liść (indeks 4 w Twoim formacie)
+        is_leaf = tl.load(tree_ptr + tree_node_base + 4, mask=active, other=0).to(tl.float32)
+        
+        # Jeśli liść, dodaj wartość do wyniku i dezaktywuj wątek
         leaf_mask = active & (is_leaf > 0.5)
-        if tl.reduce(leaf_mask, 0, "any"):
-            val = tl.load(tree_ptr + tree_node_base + 5, mask=leaf_mask)
+        if tl.any(leaf_mask, axis=0):
+            val = tl.load(tree_ptr + tree_node_base + 5, mask=leaf_mask, other=0.0)
+            # Używamy atomic_add, bo wiele drzew (t_idx) pisze do tej samej próbki (s_idx)
             tl.atomic_add(out_ptr + s_idx, val * lr, mask=leaf_mask)
             active = active & (~leaf_mask)
-        feat = tl.load(tree_ptr + tree_node_base + 0, mask=active).to(tl.int32)
-        split_bin = tl.load(tree_ptr + tree_node_base + 1, mask=active)
-        bin_val = tl.load(bin_ptr + s_idx * F + feat, mask=active)
-        left_id = tl.load(tree_ptr + tree_node_base + 2, mask=active).to(tl.int32)
-        right_id = tl.load(tree_ptr + tree_node_base + 3, mask=active).to(tl.int32)
+        
+        # Jeśli nie liść, idź dalej (indeks 0: feature, 1: threshold, 2: left, 3: right)
+        # Musimy ładować tylko dla tych, którzy są wciąż aktywni
+        feat = tl.load(tree_ptr + tree_node_base + 0, mask=active, other=0).to(tl.int32)
+        split_bin = tl.load(tree_ptr + tree_node_base + 1, mask=active, other=0)
+        
+        # Pobranie wartości cechy dla danej próbki
+        bin_val = tl.load(bin_ptr + s_idx * F + feat, mask=active, other=0)
+        
+        left_id = tl.load(tree_ptr + tree_node_base + 2, mask=active, other=0).to(tl.int32)
+        right_id = tl.load(tree_ptr + tree_node_base + 3, mask=active, other=0).to(tl.int32)
+        
         node_id = tl.where(bin_val <= split_bin, left_id, right_id)
-
 
 
 # --- WRAPPERS ---

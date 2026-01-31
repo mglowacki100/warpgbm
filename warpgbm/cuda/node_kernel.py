@@ -28,7 +28,7 @@ def _bin_column_kernel(
 
 # --- KERNEL 2: HISTOGRAM ---
 @triton.jit
-def _histogram_kernel_optimized(
+def _histogram_kernel(
     bin_ptr,            # Pointer to bin indices [N, F_master]
     res_ptr,            # Pointer to residuals [N]
     sample_idx_ptr,     # Pointer to active sample indices [N_active]

@@ -109,43 +109,77 @@ def _split_kernel(
         
         tl.store(gain_ptr + base_out + b, tl.where(valid, gain, 0.0), mask=f_mask)
         tl.store(dir_ptr + base_out + b, tl.where(valid, direction, 0.0), mask=f_mask)
+        
+
+# BLOCK_SIZE is a literal Python int; Triton kernels prefer literals over constexpr for stability
+BLOCK_SIZE = 128
 
 @triton.jit
 def _predict_kernel(
-    bin_ptr, tree_ptr, out_ptr,
-    N, F, T, max_nodes, lr,
-    BLOCK_SIZE: tl.constexpr
+    bin_ptr,        # pointer to binned input data [N, F]
+    tree_ptr,       # pointer to tree tensor [T, max_nodes, 6]
+    out_ptr,        # pointer to output predictions [N]
+    N,              # number of samples
+    F,              # number of features
+    T,              # number of trees
+    max_nodes,      # maximum number of nodes per tree
+    lr              # learning rate / tree weight
 ):
+    # program id for 1D grid
     pid = tl.program_id(0)
-    idx = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)  # <- używaj BLOCK_SIZE bezpośrednio
 
+    # compute global indices for this block
+    idx = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+
+    # mask to avoid out-of-bounds threads
     mask = idx < (N * T)
+
+    # sample index and tree index for each thread
     s_idx = idx % N
     t_idx = idx // N
 
+    # initialize node id at root (0) for each sample-tree pair
     node_id = tl.zeros([BLOCK_SIZE], dtype=tl.int32)
+
+    # active mask: threads still traversing the tree
     active = mask
 
+    # max depth safeguard
     for _ in range(64):
+        # break loop if no active threads
         if not tl.reduce(active, 0, "any"):
             break
 
+        # base offset for current nodes in tree tensor
         tree_node_base = t_idx * max_nodes * 6 + node_id * 6
+
+        # load is_leaf flag from tree: >0.5 means leaf
         is_leaf = tl.load(tree_ptr + tree_node_base + 4, mask=active)
         leaf_mask = active & (is_leaf > 0.5)
 
+        # accumulate leaf values
         if tl.reduce(leaf_mask, 0, "any"):
             val = tl.load(tree_ptr + tree_node_base + 5, mask=leaf_mask)
+            # atomic add to output predictions
             tl.atomic_add(out_ptr + s_idx, val * lr, mask=leaf_mask)
+            # deactivate threads that reached a leaf
             active = active & (~leaf_mask)
 
+        # select feature and split value for current node
         feat = tl.load(tree_ptr + tree_node_base + 0, mask=active).to(tl.int32)
         split_bin = tl.load(tree_ptr + tree_node_base + 1, mask=active)
+
+        # load binned feature value for each sample
         bin_val = tl.load(bin_ptr + s_idx * F + feat, mask=active)
 
+        # load left/right child node ids
         left_id = tl.load(tree_ptr + tree_node_base + 2, mask=active).to(tl.int32)
         right_id = tl.load(tree_ptr + tree_node_base + 3, mask=active).to(tl.int32)
+
+        # move to next node according to split decision
         node_id = tl.where(bin_val <= split_bin, left_id, right_id)
+
+
 
 
 

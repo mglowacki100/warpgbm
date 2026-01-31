@@ -111,42 +111,6 @@ def _split_kernel(
         tl.store(dir_ptr + base_out + b, tl.where(valid, direction, 0.0), mask=f_mask)
         
 
-# BLOCK_SIZE is a literal Python int; Triton kernels prefer literals over constexpr for stability
-#BLOCK_SIZE = 128
-
-
-
-# @triton.jit
-# def _predict_kernel(
-#     bin_ptr, tree_ptr, out_ptr,
-#     N, F, T, max_nodes, lr,
-#     BLOCK_SIZE: tl.constexpr  # <- compile-time constant
-# ):
-#     pid = tl.program_id(0)
-#     idx = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-#     mask = idx < (N * T)
-#     s_idx = idx % N
-#     t_idx = idx // N
-#     node_id = tl.zeros([BLOCK_SIZE], dtype=tl.int32)
-#     active = mask
-#     for _ in range(64):
-#         if not tl.reduce(active, 0, "any"):
-#             break
-#         tree_node_base = t_idx * max_nodes * 6 + node_id * 6
-#         is_leaf = tl.load(tree_ptr + tree_node_base + 4, mask=active)
-#         leaf_mask = active & (is_leaf > 0.5)
-#         if tl.reduce(leaf_mask, 0, "any"):
-#             val = tl.load(tree_ptr + tree_node_base + 5, mask=leaf_mask)
-#             tl.atomic_add(out_ptr + s_idx, val * lr, mask=leaf_mask)
-#             active = active & (~leaf_mask)
-#         feat = tl.load(tree_ptr + tree_node_base + 0, mask=active).to(tl.int32)
-#         split_bin = tl.load(tree_ptr + tree_node_base + 1, mask=active)
-#         bin_val = tl.load(bin_ptr + s_idx * F + feat, mask=active)
-#         left_id = tl.load(tree_ptr + tree_node_base + 2, mask=active).to(tl.int32)
-#         right_id = tl.load(tree_ptr + tree_node_base + 3, mask=active).to(tl.int32)
-#         node_id = tl.where(bin_val <= split_bin, left_id, right_id)
-
-
 @triton.jit
 def _predict_kernel(
     bin_ptr, tree_ptr, out_ptr,
@@ -167,28 +131,27 @@ def _predict_kernel(
     active = mask
     
     # Przechodzenie po drzewie
+    
     for _ in range(64):
-        # Sprawdzenie czy jakiekolwiek włókno w bloku jeszcze pracuje
-        if tl.max(active.to(tl.int32), axis=0) == 0:
-            break
-        # if not tl.any(active, axis=0):
-        #     break
-            
+        # 1. Definiujemy bazę dla węzła (tylko dla tych, co są w grze)
         tree_node_base = t_idx * max_nodes * 6 + node_id * 6
         
-        # Ładujemy informację czy to liść (indeks 4 w Twoim formacie)
+        # 2. Sprawdzamy, czy to liść
+        # Ustawiamy mask=active, aby nie czytać śmieci z pamięci
         is_leaf = tl.load(tree_ptr + tree_node_base + 4, mask=active, other=0).to(tl.float32)
         
-        # Jeśli liść, dodaj wartość do wyniku i dezaktywuj wątek
+        # 3. Jeśli to liść I wątek jest aktywny -> zapisujemy wynik i dezaktywujemy wątek
         leaf_mask = active & (is_leaf > 0.5)
-        if tl.any(leaf_mask, axis=0):
-            val = tl.load(tree_ptr + tree_node_base + 5, mask=leaf_mask, other=0.0)
-            # Używamy atomic_add, bo wiele drzew (t_idx) pisze do tej samej próbki (s_idx)
-            tl.atomic_add(out_ptr + s_idx, val * lr, mask=leaf_mask)
-            active = active & (~leaf_mask)
         
-        # Jeśli nie liść, idź dalej (indeks 0: feature, 1: threshold, 2: left, 3: right)
-        # Musimy ładować tylko dla tych, którzy są wciąż aktywni
+        # Wartość liścia (indeks 5)
+        leaf_val = tl.load(tree_ptr + tree_node_base + 5, mask=leaf_mask, other=0.0)
+        tl.atomic_add(out_ptr + s_idx, leaf_val * lr, mask=leaf_mask)
+        
+        # Kluczowe: wątki, które trafiły na liść, przestają być aktywne w kolejnych iteracjach
+        active = active & (~leaf_mask)
+        
+        # 4. Dla reszty aktywnych wątków: idziemy głębiej w drzewo
+        # Używamy mask=active, aby uniknąć błędów Out of Bounds
         feat = tl.load(tree_ptr + tree_node_base + 0, mask=active, other=0).to(tl.int32)
         split_bin = tl.load(tree_ptr + tree_node_base + 1, mask=active, other=0)
         
@@ -198,8 +161,10 @@ def _predict_kernel(
         left_id = tl.load(tree_ptr + tree_node_base + 2, mask=active, other=0).to(tl.int32)
         right_id = tl.load(tree_ptr + tree_node_base + 3, mask=active, other=0).to(tl.int32)
         
+        # Aktualizacja node_id dla następnej iteracji
         node_id = tl.where(bin_val <= split_bin, left_id, right_id)
-
+        
+  
 
 # --- WRAPPERS ---
 

@@ -29,25 +29,26 @@ def _bin_column_kernel(
 # --- KERNEL 2: HISTOGRAM ---
 @triton.jit
 def _histogram_kernel(
-    bin_ptr,            # Pointer to bin indices [N, F_master]
-    res_ptr,            # Pointer to residuals [N]
-    sample_idx_ptr,     # Pointer to active sample indices [N_active]
-    feat_idx_ptr,       # Pointer to active feature mapping [F_active]
-    era_idx_ptr,        # Pointer to era indices [N]
-    grad_hist_ptr,      # Output: Gradient histogram [num_eras, F_active, B]
-    hess_hist_ptr,      # Output: Hessian histogram [num_eras, F_active, B]
-    N,                  # Total number of active samples
-    F_master,           # Total features in the original dataset
-    F_active,           # Number of features we are currently processing
-    B,                  # Number of bins (e.g., 5)
-    num_eras,           # Number of eras
-    BLOCK_SIZE: tl.constexpr
+    bin_ptr,  # Pointer to bin indices [N, F_master]
+    res_ptr,  # Pointer to residuals [N]
+    sample_idx_ptr,  # Pointer to active sample indices [N_active]
+    feat_idx_ptr,  # Pointer to active feature mapping [F_active]
+    era_idx_ptr,  # Pointer to era indices [N]
+    grad_hist_ptr,  # Output: Gradient histogram [num_eras, F_active, B]
+    hess_hist_ptr,  # Output: Hessian histogram [num_eras, F_active, B]
+    N,  # Total number of active samples
+    F_master,  # Total features in the original dataset
+    F_active,  # Number of features we are currently processing
+    B,  # Number of bins (e.g., 5)
+    num_eras,  # Number of eras
+    BLOCK_SIZE: tl.constexpr,
+    ERA_BIN_SIZE: tl.constexpr  # Precomputed num_eras * B for flat shared memory
 ):
-    # 1. Thread Mapping
-    # Program ID 0 manages which feature we are processing
-    # Program ID 1 manages the tile/block of samples
-    feat_order_idx = tl.program_id(0) 
-    tile_idx = tl.program_id(1)      
+    # Thread Mapping
+    # program_id(0): feature order index (0 to F_active-1)
+    # program_id(1): tile/block of samples
+    feat_order_idx = tl.program_id(0)
+    tile_idx = tl.program_id(1)
     
     # Load the actual feature index from the mapping table
     feat_idx = tl.load(feat_idx_ptr + feat_order_idx)
@@ -56,67 +57,113 @@ def _histogram_kernel(
     row_offsets = tile_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     row_mask = row_offsets < N
     
-    # 2. Data Loading (Coalesced Memory Access)
+    # Data Loading (Coalesced Memory Access)
     # Load indices of samples belonging to the current node/active set
     s_indices = tl.load(sample_idx_ptr + row_offsets, mask=row_mask)
     
     # Load era and bin assignments for these specific samples
-    # bins: find the bin for the specific sample and feature
     eras = tl.load(era_idx_ptr + s_indices, mask=row_mask)
     bins = tl.load(bin_ptr + s_indices * F_master + feat_idx, mask=row_mask)
     residuals = tl.load(res_ptr + s_indices, mask=row_mask)
-
-    # 3. Destination Address Calculation
-    # The histogram is stored in a 3D layout: [era, feature, bin]
-    # We flatten this to a 1D offset: 
-    # offset = (era * total_features_in_output * bins_per_feat) + (feat_idx * bins_per_feat) + bin
-    output_offset = eras * (F_active * B) + feat_order_idx * B + bins
     
-    # 4. Atomic Aggregation
-    # Instead of looping through all possible bins and eras, we "scatter" the 
-    # values directly to their destination using hardware-accelerated atomics.
-    # At B=5, the L2 cache efficiently handles collisions.
-    tl.atomic_add(grad_hist_ptr + output_offset, residuals, mask=row_mask)
-    tl.atomic_add(hess_hist_ptr + output_offset, 1.0, mask=row_mask)
+    # Allocate shared memory for local histograms (flat arrays for grad and hess)
+    # Size: 2 * num_eras * B (one for grad, one for hess)
+    # Assuming num_eras and B are small enough to fit in shared mem (<48KB)
+    shared_grad = tl.zeros([ERA_BIN_SIZE], dtype=tl.float32)
+    shared_hess = tl.zeros([ERA_BIN_SIZE], dtype=tl.float32)
+    
+    # Initialize shared memory to zero (distributed across threads)
+    thread_idx = tl.arange(0, BLOCK_SIZE)
+    for i in tl.range(0, ERA_BIN_SIZE, BLOCK_SIZE, num_stages=1):
+        idx = i + thread_idx
+        mask_init = idx < ERA_BIN_SIZE
+        tl.store(shared_grad + idx, 0.0, mask=mask_init)
+        tl.store(shared_hess + idx, 0.0, mask=mask_init)
+    
+    tl.sync_barrier()  # Ensure all threads have initialized shared mem
+    
+    # Local aggregation: Atomic add to shared memory (faster than global)
+    # Offset in shared: era * B + bin
+    local_offset = eras * B + bins
+    tl.atomic_add(shared_grad + local_offset, residuals, mask=row_mask)
+    tl.atomic_add(shared_hess + local_offset, 1.0, mask=row_mask)
+    
+    tl.sync_barrier()  # Sync after all local additions
+    
+    # Reduction: Aggregate from shared to global memory
+    # Distribute the work: each thread handles a portion of the era-bin space
+    # Global offset: era * (F_active * B) + feat_order_idx * B + bin
+    for i in tl.range(0, ERA_BIN_SIZE, BLOCK_SIZE, num_stages=1):
+        idx = i + thread_idx
+        mask_reduce = idx < ERA_BIN_SIZE
+        era = idx // B
+        bin_val = idx % B
+        
+        # Load from shared
+        grad_val = tl.load(shared_grad + idx, mask=mask_reduce, other=0.0)
+        hess_val = tl.load(shared_hess + idx, mask=mask_reduce, other=0.0)
+        
+        # Compute global offset
+        global_offset = era * (F_active * B) + feat_order_idx * B + bin_val
+        
+        # Atomic add to global
+        tl.atomic_add(grad_hist_ptr + global_offset, grad_val, mask=mask_reduce)
+        tl.atomic_add(hess_hist_ptr + global_offset, hess_val, mask=mask_reduce)
 
 
 # @triton.jit
 # def _histogram_kernel(
-#     bin_ptr, res_ptr, sample_idx_ptr, feat_idx_ptr, era_idx_ptr,
-#     grad_hist_ptr, hess_hist_ptr,
-#     N, F_master, F_active, B, num_eras,
+#     bin_ptr,            # Pointer to bin indices [N, F_master]
+#     res_ptr,            # Pointer to residuals [N]
+#     sample_idx_ptr,     # Pointer to active sample indices [N_active]
+#     feat_idx_ptr,       # Pointer to active feature mapping [F_active]
+#     era_idx_ptr,        # Pointer to era indices [N]
+#     grad_hist_ptr,      # Output: Gradient histogram [num_eras, F_active, B]
+#     hess_hist_ptr,      # Output: Hessian histogram [num_eras, F_active, B]
+#     N,                  # Total number of active samples
+#     F_master,           # Total features in the original dataset
+#     F_active,           # Number of features we are currently processing
+#     B,                  # Number of bins (e.g., 5)
+#     num_eras,           # Number of eras
 #     BLOCK_SIZE: tl.constexpr
 # ):
-#     feat_order_idx = tl.program_id(0) # Która cecha z listy wybranych
-#     tile_idx = tl.program_id(1)      # Który blok próbek
+#     # 1. Thread Mapping
+#     # Program ID 0 manages which feature we are processing
+#     # Program ID 1 manages the tile/block of samples
+#     feat_order_idx = tl.program_id(0) 
+#     tile_idx = tl.program_id(1)      
     
-#     # Pobierz prawdziwy indeks cechy z mapowania
+#     # Load the actual feature index from the mapping table
 #     feat_idx = tl.load(feat_idx_ptr + feat_order_idx)
     
+#     # Calculate sample offsets for this block
 #     row_offsets = tile_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
 #     row_mask = row_offsets < N
     
-#     # Załadowanie indeksów próbek i przypisanie do er oraz binów
-#     s_idx = tl.load(sample_idx_ptr + row_offsets, mask=row_mask)
-#     era = tl.load(era_idx_ptr + s_idx, mask=row_mask)
-#     # Załadowanie binów: bin_indices[sample * F_master + feat]
-#     b_val = tl.load(bin_ptr + s_idx * F_master + feat_idx, mask=row_mask)
-#     res = tl.load(res_ptr + s_idx, mask=row_mask)
+#     # 2. Data Loading (Coalesced Memory Access)
+#     # Load indices of samples belonging to the current node/active set
+#     s_indices = tl.load(sample_idx_ptr + row_offsets, mask=row_mask)
+    
+#     # Load era and bin assignments for these specific samples
+#     # bins: find the bin for the specific sample and feature
+#     eras = tl.load(era_idx_ptr + s_indices, mask=row_mask)
+#     bins = tl.load(bin_ptr + s_indices * F_master + feat_idx, mask=row_mask)
+#     residuals = tl.load(res_ptr + s_indices, mask=row_mask)
 
-#     # Iteracja po erach i binach wewnątrz bloku
-#     # Triton zoptymalizuje to pod kątem dostępu do pamięci
-#     for e in range(num_eras):
-#         era_mask = row_mask & (era == e)
-#         for b in range(B):
-#             final_mask = era_mask & (b_val == b)
-            
-#             g_sum = tl.sum(tl.where(final_mask, res, 0.0), axis=0)
-#             h_sum = tl.sum(tl.where(final_mask, 1.0, 0.0), axis=0)
-            
-#             if g_sum != 0 or h_sum != 0:
-#                 out_off = e * (F_active * B) + feat_order_idx * B + b
-#                 tl.atomic_add(grad_hist_ptr + out_off, g_sum)
-#                 tl.atomic_add(hess_hist_ptr + out_off, h_sum)
+#     # 3. Destination Address Calculation
+#     # The histogram is stored in a 3D layout: [era, feature, bin]
+#     # We flatten this to a 1D offset: 
+#     # offset = (era * total_features_in_output * bins_per_feat) + (feat_idx * bins_per_feat) + bin
+#     output_offset = eras * (F_active * B) + feat_order_idx * B + bins
+    
+#     # 4. Atomic Aggregation
+#     # Instead of looping through all possible bins and eras, we "scatter" the 
+#     # values directly to their destination using hardware-accelerated atomics.
+#     # At B=5, the L2 cache efficiently handles collisions.
+#     tl.atomic_add(grad_hist_ptr + output_offset, residuals, mask=row_mask)
+#     tl.atomic_add(hess_hist_ptr + output_offset, 1.0, mask=row_mask)
+
+
 
 # --- KERNEL 3: DIRECTIONAL SPLIT ---
 @triton.jit
@@ -155,8 +202,8 @@ def _split_kernel(
         valid = (h_left >= min_child_samples) & (h_right >= min_child_samples)
         
         gain = (g_left * g_left) / (h_left + eps) + \
-               (g_right * g_right) / (h_right + eps) - \
-               (g_tot * g_tot) / (h_tot + eps)
+                (g_right * g_right) / (h_right + eps) - \
+                (g_tot * g_tot) / (h_tot + eps)
         
         direction = tl.where((g_left / (h_left + eps)) > (g_right / (h_right + eps)), 1.0, -1.0)
         
@@ -226,23 +273,50 @@ def custom_cuda_binner(X, bin_edges, bin_indices):
     grid = lambda meta: (triton.cdiv(N, meta['BLOCK_SIZE']),)
     _bin_column_kernel[grid](X, bin_edges, bin_indices, N, bin_edges.size(0), BLOCK_SIZE=256)
 
-def compute_histogram3(bin_indices, residuals, sample_indices, feature_indices, era_indices, 
+
+
+def compute_histogram3(bin_indices, residuals, sample_indices, feature_indices, era_indices,
                        grad_hist, hess_hist, num_bins, threads_per_block=256, rows_per_thread=1):
     N = sample_indices.size(0)
     F_active = feature_indices.size(0)
     F_master = bin_indices.size(1)
     num_eras = grad_hist.size(0)
     
-    # Czyścimy histogramy przed użyciem
+    # Clear histograms before use (on CPU, or move to kernel if needed)
     grad_hist.fill_(0)
     hess_hist.fill_(0)
-
+    
+    # Precompute ERA_BIN_SIZE as constexpr
+    ERA_BIN_SIZE = num_eras * num_bins
+    
+    # Ensure it fits in shared mem (add check if needed)
+    assert ERA_BIN_SIZE * 4 * 2 < 48000, "Shared memory overflow: reduce num_eras or B"
+    
     grid = (F_active, triton.cdiv(N, threads_per_block))
     _histogram_kernel[grid](
         bin_indices, residuals, sample_indices, feature_indices, era_indices,
         grad_hist, hess_hist, N, F_master, F_active, num_bins, num_eras,
-        BLOCK_SIZE=threads_per_block
+        BLOCK_SIZE=threads_per_block,
+        ERA_BIN_SIZE=ERA_BIN_SIZE  # Pass as constexpr
     )
+    
+# def compute_histogram3(bin_indices, residuals, sample_indices, feature_indices, era_indices, 
+#                        grad_hist, hess_hist, num_bins, threads_per_block=256, rows_per_thread=1):
+#     N = sample_indices.size(0)
+#     F_active = feature_indices.size(0)
+#     F_master = bin_indices.size(1)
+#     num_eras = grad_hist.size(0)
+    
+#     # Czyścimy histogramy przed użyciem
+#     grad_hist.fill_(0)
+#     hess_hist.fill_(0)
+
+#     grid = (F_active, triton.cdiv(N, threads_per_block))
+#     _histogram_kernel[grid](
+#         bin_indices, residuals, sample_indices, feature_indices, era_indices,
+#         grad_hist, hess_hist, N, F_master, F_active, num_bins, num_eras,
+#         BLOCK_SIZE=threads_per_block
+#     )
 
 def compute_split(G, H, min_split_gain, min_child_samples, eps, per_era_gain, per_era_direction, threads=128):
     E, F, B = G.shape

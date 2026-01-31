@@ -27,6 +27,14 @@ def _bin_column_kernel(
 
 
 # --- KERNEL 2: HISTOGRAM ---
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE': 256}),
+        triton.Config({'BLOCK_SIZE': 512}),
+        triton.Config({'BLOCK_SIZE': 1024}),
+    ],
+    key=['N']
+)
 @triton.jit
 def _histogram_kernel(
     bin_ptr,  # Pointer to bin indices [N, F_master]
@@ -292,13 +300,41 @@ def compute_histogram3(bin_indices, residuals, sample_indices, feature_indices, 
     # Ensure it fits in shared mem (add check if needed)
     assert ERA_BIN_SIZE * 4 * 2 < 48000, "Shared memory overflow: reduce num_eras or B"
     
-    grid = (F_active, triton.cdiv(N, threads_per_block))
+    # Grid computation: Use meta['BLOCK_SIZE'] in lambda for autotune compatibility
+    grid = lambda meta: (F_active, triton.cdiv(N, meta['BLOCK_SIZE']))
+    
     _histogram_kernel[grid](
         bin_indices, residuals, sample_indices, feature_indices, era_indices,
         grad_hist, hess_hist, N, F_master, F_active, num_bins, num_eras,
-        BLOCK_SIZE=threads_per_block,
         ERA_BIN_SIZE=ERA_BIN_SIZE  # Pass as constexpr
     )
+
+
+#OLD
+# def compute_histogram3(bin_indices, residuals, sample_indices, feature_indices, era_indices,
+#                        grad_hist, hess_hist, num_bins, threads_per_block=256, rows_per_thread=1):
+#     N = sample_indices.size(0)
+#     F_active = feature_indices.size(0)
+#     F_master = bin_indices.size(1)
+#     num_eras = grad_hist.size(0)
+    
+#     # Clear histograms before use (on CPU, or move to kernel if needed)
+#     grad_hist.fill_(0)
+#     hess_hist.fill_(0)
+    
+#     # Precompute ERA_BIN_SIZE as constexpr
+#     ERA_BIN_SIZE = num_eras * num_bins
+    
+#     # Ensure it fits in shared mem (add check if needed)
+#     assert ERA_BIN_SIZE * 4 * 2 < 48000, "Shared memory overflow: reduce num_eras or B"
+    
+#     grid = (F_active, triton.cdiv(N, threads_per_block))
+#     _histogram_kernel[grid](
+#         bin_indices, residuals, sample_indices, feature_indices, era_indices,
+#         grad_hist, hess_hist, N, F_master, F_active, num_bins, num_eras,
+#         BLOCK_SIZE=threads_per_block,
+#         ERA_BIN_SIZE=ERA_BIN_SIZE  # Pass as constexpr
+#     )
     
 # def compute_histogram3(bin_indices, residuals, sample_indices, feature_indices, era_indices, 
 #                        grad_hist, hess_hist, num_bins, threads_per_block=256, rows_per_thread=1):

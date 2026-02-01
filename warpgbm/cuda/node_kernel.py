@@ -26,99 +26,6 @@ def _bin_column_kernel(
     tl.store(bin_indices_ptr + offsets, bin_idx.to(tl.int8), mask=mask)
 
 
-# --- KERNEL 2: HISTOGRAM ---
-# @triton.autotune(
-#     configs=[
-#         triton.Config({'BLOCK_SIZE': 256}),
-#         triton.Config({'BLOCK_SIZE': 512}),
-#         triton.Config({'BLOCK_SIZE': 1024}),
-#     ],
-#     key=['N']
-# )
-# @triton.jit
-# def _histogram_kernel(
-#     bin_ptr,  # Pointer to bin indices [N, F_master]
-#     res_ptr,  # Pointer to residuals [N]
-#     sample_idx_ptr,  # Pointer to active sample indices [N_active]
-#     feat_idx_ptr,  # Pointer to active feature mapping [F_active]
-#     era_idx_ptr,  # Pointer to era indices [N]
-#     grad_hist_ptr,  # Output: Gradient histogram [num_eras, F_active, B]
-#     hess_hist_ptr,  # Output: Hessian histogram [num_eras, F_active, B]
-#     N,  # Total number of active samples
-#     F_master,  # Total features in the original dataset
-#     F_active,  # Number of features we are currently processing
-#     B,  # Number of bins (e.g., 5)
-#     num_eras,  # Number of eras
-#     BLOCK_SIZE: tl.constexpr,
-#     ERA_BIN_SIZE: tl.constexpr  # Precomputed num_eras * B for flat shared memory
-# ):
-#     # Thread Mapping
-#     # program_id(0): feature order index (0 to F_active-1)
-#     # program_id(1): tile/block of samples
-#     feat_order_idx = tl.program_id(0)
-#     tile_idx = tl.program_id(1)
-    
-#     # Load the actual feature index from the mapping table
-#     feat_idx = tl.load(feat_idx_ptr + feat_order_idx)
-    
-#     # Calculate sample offsets for this block
-#     row_offsets = tile_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-#     row_mask = row_offsets < N
-    
-#     # Data Loading (Coalesced Memory Access)
-#     # Load indices of samples belonging to the current node/active set
-#     s_indices = tl.load(sample_idx_ptr + row_offsets, mask=row_mask)
-    
-#     # Load era and bin assignments for these specific samples
-#     eras = tl.load(era_idx_ptr + s_indices, mask=row_mask)
-#     bins = tl.load(bin_ptr + s_indices * F_master + feat_idx, mask=row_mask)
-#     residuals = tl.load(res_ptr + s_indices, mask=row_mask)
-    
-#     # Allocate shared memory for local histograms (flat arrays for grad and hess)
-#     # Size: 2 * num_eras * B (one for grad, one for hess)
-#     # Assuming num_eras and B are small enough to fit in shared mem (<48KB)
-#     shared_grad = tl.zeros([ERA_BIN_SIZE], dtype=tl.float32)
-#     shared_hess = tl.zeros([ERA_BIN_SIZE], dtype=tl.float32)
-    
-#     # Initialize shared memory to zero (distributed across threads)
-#     thread_idx = tl.arange(0, BLOCK_SIZE)
-#     for i in tl.range(0, ERA_BIN_SIZE, BLOCK_SIZE, num_stages=1):
-#         idx = i + thread_idx
-#         mask_init = idx < ERA_BIN_SIZE
-#         tl.store(shared_grad + idx, 0.0, mask=mask_init)
-#         tl.store(shared_hess + idx, 0.0, mask=mask_init)
-    
-#     tl.sync_barrier()  # Ensure all threads have initialized shared mem
-#     #tl.debug_barrier()
-    
-#     # Local aggregation: Atomic add to shared memory (faster than global)
-#     # Offset in shared: era * B + bin
-#     local_offset = eras * B + bins
-#     tl.atomic_add(shared_grad + local_offset, residuals, mask=row_mask)
-#     tl.atomic_add(shared_hess + local_offset, 1.0, mask=row_mask)
-    
-#     tl.sync_barrier()  # Sync after all local additions
-#     #tl.debug_barrier()
-    
-#     # Reduction: Aggregate from shared to global memory
-#     # Distribute the work: each thread handles a portion of the era-bin space
-#     # Global offset: era * (F_active * B) + feat_order_idx * B + bin
-#     for i in tl.range(0, ERA_BIN_SIZE, BLOCK_SIZE, num_stages=1):
-#         idx = i + thread_idx
-#         mask_reduce = idx < ERA_BIN_SIZE
-#         era = idx // B
-#         bin_val = idx % B
-        
-#         # Load from shared
-#         grad_val = tl.load(shared_grad + idx, mask=mask_reduce, other=0.0)
-#         hess_val = tl.load(shared_hess + idx, mask=mask_reduce, other=0.0)
-        
-#         # Compute global offset
-#         global_offset = era * (F_active * B) + feat_order_idx * B + bin_val
-        
-#         # Atomic add to global
-#         tl.atomic_add(grad_hist_ptr + global_offset, grad_val, mask=mask_reduce)
-#         tl.atomic_add(hess_hist_ptr + global_offset, hess_val, mask=mask_reduce)
 
 
 @triton.jit
@@ -312,49 +219,49 @@ def custom_cuda_binner(X, bin_edges, bin_indices):
 #     )
 
 
-#OLD
-def compute_histogram3(bin_indices, residuals, sample_indices, feature_indices, era_indices,
+# #OLD
+# def compute_histogram3(bin_indices, residuals, sample_indices, feature_indices, era_indices,
+#                         grad_hist, hess_hist, num_bins, threads_per_block=256, rows_per_thread=1):
+#     N = sample_indices.size(0)
+#     F_active = feature_indices.size(0)
+#     F_master = bin_indices.size(1)
+#     num_eras = grad_hist.size(0)
+    
+#     # Clear histograms before use (on CPU, or move to kernel if needed)
+#     grad_hist.fill_(0)
+#     hess_hist.fill_(0)
+    
+#     # Precompute ERA_BIN_SIZE as constexpr
+#     ERA_BIN_SIZE = num_eras * num_bins
+    
+#     # Ensure it fits in shared mem (add check if needed)
+#     assert ERA_BIN_SIZE * 4 * 2 < 48000, "Shared memory overflow: reduce num_eras or B"
+    
+#     grid = (F_active, triton.cdiv(N, threads_per_block))
+#     _histogram_kernel[grid](
+#         bin_indices, residuals, sample_indices, feature_indices, era_indices,
+#         grad_hist, hess_hist, N, F_master, F_active, num_bins, num_eras,
+#         BLOCK_SIZE=threads_per_block,
+#         ERA_BIN_SIZE=ERA_BIN_SIZE  # Pass as constexpr
+#     )
+    
+def compute_histogram3(bin_indices, residuals, sample_indices, feature_indices, era_indices, 
                         grad_hist, hess_hist, num_bins, threads_per_block=256, rows_per_thread=1):
     N = sample_indices.size(0)
     F_active = feature_indices.size(0)
     F_master = bin_indices.size(1)
     num_eras = grad_hist.size(0)
     
-    # Clear histograms before use (on CPU, or move to kernel if needed)
+    # Czyścimy histogramy przed użyciem
     grad_hist.fill_(0)
     hess_hist.fill_(0)
-    
-    # Precompute ERA_BIN_SIZE as constexpr
-    ERA_BIN_SIZE = num_eras * num_bins
-    
-    # Ensure it fits in shared mem (add check if needed)
-    assert ERA_BIN_SIZE * 4 * 2 < 48000, "Shared memory overflow: reduce num_eras or B"
-    
+
     grid = (F_active, triton.cdiv(N, threads_per_block))
     _histogram_kernel[grid](
         bin_indices, residuals, sample_indices, feature_indices, era_indices,
         grad_hist, hess_hist, N, F_master, F_active, num_bins, num_eras,
-        BLOCK_SIZE=threads_per_block,
-        ERA_BIN_SIZE=ERA_BIN_SIZE  # Pass as constexpr
+        BLOCK_SIZE=threads_per_block
     )
-    
-# def compute_histogram3(bin_indices, residuals, sample_indices, feature_indices, era_indices, 
-#                        grad_hist, hess_hist, num_bins, threads_per_block=256, rows_per_thread=1):
-#     N = sample_indices.size(0)
-#     F_active = feature_indices.size(0)
-#     F_master = bin_indices.size(1)
-#     num_eras = grad_hist.size(0)
-    
-#     # Czyścimy histogramy przed użyciem
-#     grad_hist.fill_(0)
-#     hess_hist.fill_(0)
-
-#     grid = (F_active, triton.cdiv(N, threads_per_block))
-#     _histogram_kernel[grid](
-#         bin_indices, residuals, sample_indices, feature_indices, era_indices,
-#         grad_hist, hess_hist, N, F_master, F_active, num_bins, num_eras,
-#         BLOCK_SIZE=threads_per_block
-#     )
 
 def compute_split(G, H, min_split_gain, min_child_samples, eps, per_era_gain, per_era_direction, threads=128):
     E, F, B = G.shape

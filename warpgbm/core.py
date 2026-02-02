@@ -254,15 +254,36 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         self._is_fitted = True
         return self
 
-    def predict(self, X):
-        if not self._is_fitted:
-            raise RuntimeError("Model is not fitted yet.")
+    
+    def predict(self, X_np):
+        """
+        Predict on new data.
         
-        num_samples = X.shape[0]
-        # Move base prediction to result
-        preds = torch.full((num_samples,), self.base_prediction, device=self.device)
+        For regression: returns predicted values
+        For classification: returns predicted class labels
+        """
+        if self.objective == "multiclass" or self.objective == "binary":
+            # Classification: return class labels
+            probs = self.predict_proba(X_np)
+            class_indices = np.argmax(probs, axis=1)
+            return self.label_encoder.inverse_transform(class_indices)
+        else:
+            # Regression: return values
+            bin_indices = self.bin_inference_data(X_np)
+            preds = self.predict_binned(bin_indices).cpu().numpy()
+            del bin_indices
+            return preds
+    
+    
+    # def predict(self, X):
+    #     if not self._is_fitted:
+    #         raise RuntimeError("Model is not fitted yet.")
         
-        # In a real implementation, you'd bin X using self.bin_edges here
-        # and then traverse each tree in self.forest.
-        # This is a simplified placeholder:
-        return preds.cpu().numpy()
+    #     num_samples = X.shape[0]
+    #     # Move base prediction to result
+    #     preds = torch.full((num_samples,), self.base_prediction, device=self.device)
+        
+    #     # In a real implementation, you'd bin X using self.bin_edges here
+    #     # and then traverse each tree in self.forest.
+    #     # This is a simplified placeholder:
+    #     return preds.cpu().numpy()

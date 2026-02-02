@@ -159,7 +159,9 @@ def compute_histogram3(bin_indices, residuals, sample_indices, feature_indices, 
         grad_hist, hess_hist, N, F_master, F_active, num_bins, num_eras
     )
 
-def compute_split(G, H, min_split_gain, min_child_samples, eps, per_era_gain, per_era_direction):
+def compute_split(G, H, min_split_gain, min_child_samples, eps, 
+                  per_era_gain, per_era_direction,
+                  threads=None): #threads adjust api
     E, F, B = G.shape
     split_kernel(
         G, H, per_era_gain, per_era_direction, E, F, B,

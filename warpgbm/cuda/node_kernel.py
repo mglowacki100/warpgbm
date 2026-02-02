@@ -151,8 +151,8 @@ def compute_histogram3(bin_indices, residuals, sample_indices, feature_indices, 
     num_eras = grad_hist.size(0)
     
     # Clear histograms (Taichi ndarrays are zero-initialized, but to be safe)
-    grad_hist.fill(0.0)
-    hess_hist.fill(0.0)
+    grad_hist.fill_(0.0) #FIX
+    hess_hist.fill_(0.0) #FIX
     
     histogram_kernel(
         bin_indices, residuals, sample_indices, feature_indices, era_indices,

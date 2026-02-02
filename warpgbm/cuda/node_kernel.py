@@ -142,7 +142,9 @@ def custom_cuda_binner(X, bin_edges, bin_indices):
     bin_column_kernel(X, bin_edges, bin_indices, N, B_minus1)
 
 def compute_histogram3(bin_indices, residuals, sample_indices, feature_indices, era_indices,
-                       grad_hist, hess_hist, num_bins):
+                       grad_hist, hess_hist, num_bins,
+                       threads_per_block=None, rows_per_thread=None, #just to make signature compliant with core.py
+                       ):
     N = sample_indices.size(0)
     F_active = feature_indices.size(0)
     F_master = bin_indices.size(1)

@@ -11,6 +11,7 @@ requires-python = ">=3.8"
 license = { file = "LICENSE" }
 dependencies = [
     "torch",
+    "taichi",
     "numpy",
     "tqdm",
     "scikit-learn"              

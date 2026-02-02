@@ -274,16 +274,84 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             del bin_indices
             return preds
     
+        
+    def predict_binned(self, bin_indices):
+        num_samples = bin_indices.size(0)
+        tree_tensor = torch.stack(
+            [
+                self.flatten_tree(tree, max_nodes=2 ** (self.max_depth + 1))
+                for tree in self.forest
+                if tree
+            ]
+        ).to(self.device)
+
+        out = torch.zeros(num_samples, device=self.device) + self.base_prediction
+        node_kernel.predict_forest(
+            bin_indices.contiguous(), tree_tensor.contiguous(), self.learning_rate, out
+        )
+
+        return out    
     
-    # def predict(self, X):
-    #     if not self._is_fitted:
-    #         raise RuntimeError("Model is not fitted yet.")
-        
-    #     num_samples = X.shape[0]
-    #     # Move base prediction to result
-    #     preds = torch.full((num_samples,), self.base_prediction, device=self.device)
-        
-    #     # In a real implementation, you'd bin X using self.bin_edges here
-    #     # and then traverse each tree in self.forest.
-    #     # This is a simplified placeholder:
-    #     return preds.cpu().numpy()
+    
+    def bin_inference_data(self, X_np):
+        is_integer_type = np.issubdtype(X_np.dtype, np.integer)
+
+        if is_integer_type and X_np.shape[1] == self.num_features:
+            max_vals = X_np.max(axis=0)
+            if np.all(max_vals < self.num_bins):
+                print("Detected pre-binned input at predict-time — skipping binning.")
+                is_prebinned = True
+            else:
+                is_prebinned = False
+        else:
+            is_prebinned = False
+
+        if is_prebinned:
+            bin_indices = torch.empty(
+                X_np.shape, dtype=torch.int8, device="cuda"
+            )
+            for f in range(self.num_features):
+                bin_indices[:,f] = torch.as_tensor( X_np[:, f], device=self.device).contiguous()
+        else:
+            bin_indices = self.bin_data_with_existing_edges(X_np)
+        return bin_indices
+    
+    
+    def flatten_tree(self, tree, max_nodes):
+        flat = torch.full((max_nodes, 6), float("nan"), dtype=torch.float32)
+        node_counter = [0]
+        node_list = []
+
+        def walk(node):
+            curr_id = node_counter[0]
+            node_counter[0] += 1
+
+            new_node = {"node_id": curr_id}
+            if "leaf_value" in node:
+                new_node["leaf_value"] = float(node["leaf_value"])
+            else:
+                new_node["best_feature"] = float(node["feature"])
+                new_node["split_bin"] = float(node["bin"])
+                new_node["left_id"] = node_counter[0]
+                walk(node["left"])
+                new_node["right_id"] = node_counter[0]
+                walk(node["right"])
+
+            node_list.append(new_node)
+            return new_node
+
+        walk(tree)
+
+        for node in node_list:
+            i = node["node_id"]
+            if "leaf_value" in node:
+                flat[i, 4] = 1.0
+                flat[i, 5] = node["leaf_value"]
+            else:
+                flat[i, 0] = node["best_feature"]
+                flat[i, 1] = node["split_bin"]
+                flat[i, 2] = node["left_id"]
+                flat[i, 3] = node["right_id"]
+                flat[i, 4] = 0.0
+
+        return flat

@@ -374,19 +374,16 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         self.era_indices = self.era_indices.to(dtype=torch.int32)
         
         # Initialize gradients (predictions)
-        if self.warm_start and self._is_fitted and self._trees_trained > 0:
-            # Warm start: restore predictions from existing forest
-            self.gradients = torch.zeros_like(self.Y_gpu) + self.base_prediction
-            # Add predictions from existing trees
-            for tree in self.forest[:self._trees_trained]:
-                if tree:
-                    leaf_updates = self._compute_tree_predictions(tree, self.bin_indices)
-                    self.gradients += leaf_updates
+
+        if self.warm_start and self._is_fitted and self.gradients is not None:
+            print("Resuming from existing gradients...")
+            # Do nothing; self.gradients from previous fit()
         else:
             # Fresh start
             self.gradients = torch.zeros_like(self.Y_gpu)
             self.base_prediction = self.Y_gpu.mean().item()
-            self.gradients += self.base_prediction
+            self.gradients += self.base_prediction    
+            
         
         self.root_node_indices = torch.arange(self.num_samples, device=self.device, dtype=torch.int32)
         self.feature_indices = torch.arange(self.num_features, device=self.device, dtype=torch.int32)
@@ -410,10 +407,6 @@ class WarpGBM(BaseEstimator, RegressorMixin):
 
         del self.bin_indices
         del self.Y_gpu
-        
-        del self.gradients  #MG
-        del self.residual   #MG
-        torch.cuda.empty_cache()
 
         gc.collect()
 

@@ -142,6 +142,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                 f"Invalid colsample_bytree: {kwargs['colsample_bytree']}. Must be a float value > 0 and <= 1."
             )
 
+    @torch.no_grad()
     def _compute_tree_predictions(self, tree, bin_indices):
         num_samples = bin_indices.size(0)
         device = self.device

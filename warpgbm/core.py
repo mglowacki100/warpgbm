@@ -143,43 +143,38 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             )
 
     def _compute_tree_predictions(self, tree, bin_indices):
-        """
-        Compute predictions from a single tree for all samples.
-        
-        Args:
-            tree: Tree dict with structure
-            bin_indices: Binned features for samples
-        
-        Returns:
-            torch.Tensor: Predictions for each sample
-        """
         num_samples = bin_indices.size(0)
-        predictions = torch.zeros(num_samples, device=self.device, dtype=torch.float32)
-        
-        def traverse(node, sample_mask):
-            """Recursively traverse tree and assign leaf values."""
+        device = self.device
+
+        predictions = torch.zeros(num_samples, device=device, dtype=torch.float32)
+
+        def traverse(node, indices):
+            if indices.numel() == 0:
+                return
+
             if "leaf_value" in node:
-                # Leaf node: assign value to all samples in this leaf
-                predictions[sample_mask] = node["leaf_value"] * self.learning_rate
+                predictions[indices] = node["leaf_value"] * self.learning_rate
             else:
-                # Split node: route samples left or right
                 feature_idx = node["feature"]
                 split_bin = node["bin"]
-                
-                # Samples go left if bin_value <= split_bin
-                go_left = bin_indices[sample_mask, feature_idx] <= split_bin
-                
-                left_mask  = sample_mask & go_left
-                right_mask = sample_mask & (~go_left)
-                
-                traverse(node["left"], left_mask)
-                traverse(node["right"], right_mask)
-        
-        # Start with all samples
-        all_samples = torch.ones(num_samples, dtype=torch.bool, device=self.device)
-        traverse(tree, all_samples)
-        
+
+                # tylko aktywne próbki
+                vals = bin_indices[indices, feature_idx]
+
+                go_left = vals <= split_bin  # (k,)
+
+                left_idx  = indices[go_left]
+                right_idx = indices[~go_left]
+
+                traverse(node["left"], left_idx)
+                traverse(node["right"], right_idx)
+
+        # start: all indices
+        all_indices = torch.arange(num_samples, device=device)
+        traverse(tree, all_indices)
+
         return predictions
+        
     
     def _compute_softmax_gradients_hessians(self, y_true_encoded):
         """

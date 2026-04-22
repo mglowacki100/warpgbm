@@ -165,8 +165,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                 group_indices = torch.arange(current_offset, current_offset + actual_group_size, 
                                              device=self.device, dtype=torch.int32)
                 
-                
-                k = max(1, int(sample_rate * actual_group_size))
+                k = max(1, int(sample_rate * actual_group_size)) if sample_rate > 0 else 0
                 
                 # Random draw inside group (permutation and cut)
                 perm = torch.randperm(actual_group_size, device=self.device)

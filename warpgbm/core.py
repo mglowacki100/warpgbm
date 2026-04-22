@@ -169,10 +169,8 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                 # Samples go left if bin_value <= split_bin
                 go_left = bin_indices[sample_mask, feature_idx] <= split_bin
                 
-                left_mask = sample_mask.clone()
-                left_mask[sample_mask] = go_left
-                right_mask = sample_mask.clone()
-                right_mask[sample_mask] = ~go_left
+                left_mask  = sample_mask & go_left
+                right_mask = sample_mask & (~go_left)
                 
                 traverse(node["left"], left_mask)
                 traverse(node["right"], right_mask)
